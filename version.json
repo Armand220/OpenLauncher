@@ -1,5 +1,5 @@
 {
-    "version": "2.0.0",
+    "version": "1.0.0",
     "py_url": "https://raw.githubusercontent.com/Armand220/OpenLauncher/main/OpenLauncher.py",
     "py_sha256": "ecc6bb10040838adf045e41c1254810f5ba5f3d2cc12aea08e49875609a11d4a",
     "exe_url": "https://github.com/Armand220/OpenLauncher/releases/download/OpenLauncherReleaseV2.0Beta/OpenLauncher.exe",
