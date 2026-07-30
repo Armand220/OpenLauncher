@@ -63,6 +63,16 @@ def build_tabs(tabview, profile_manager, workdir_var, log_func, refresh_callback
         mods = profile.get("mods", [])
         if idx < len(mods):
             removed = mods.pop(idx)
+            # Delete the actual file if it exists
+            removed_path = Path(removed)
+            if removed_path.exists():
+                try:
+                    removed_path.unlink()
+                    log_func(f"Deleted mod file: {removed_path.name}", "INFO")
+                except Exception as e:
+                    log_func(f"Could not delete mod file: {e}", "WARNING")
+            else:
+                log_func(f"Mod file already missing: {removed_path.name}", "WARNING")
             profile_manager.update_profile(profile_name, mods=mods)
             refresh_callback()
             log_func(f"Removed mod: {os.path.basename(removed)}", "INFO")
@@ -115,6 +125,16 @@ def build_tabs(tabview, profile_manager, workdir_var, log_func, refresh_callback
         rps = profile.get("resource_packs", [])
         if idx < len(rps):
             removed = rps.pop(idx)
+            # Delete the actual file if it exists
+            removed_path = Path(removed)
+            if removed_path.exists():
+                try:
+                    removed_path.unlink()
+                    log_func(f"Deleted resource pack file: {removed_path.name}", "INFO")
+                except Exception as e:
+                    log_func(f"Could not delete resource pack file: {e}", "WARNING")
+            else:
+                log_func(f"Resource pack file already missing: {removed_path.name}", "WARNING")
             profile_manager.update_profile(profile_name, resource_packs=rps)
             refresh_callback()
             log_func(f"Removed resource pack: {os.path.basename(removed)}", "INFO")
