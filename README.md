@@ -1,5 +1,5 @@
 -------------------------------------------------------------------------------
-                              OpenLauncher v4.0 Beta
+OpenLauncher v4.0 Beta
 -------------------------------------------------------------------------------
 
 A free, open‑source offline Minecraft launcher. No Microsoft account required.
