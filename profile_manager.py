@@ -18,10 +18,20 @@ class ProfileManager:
                     data = json.load(f)
                 modified = False
                 for name, prof in data.items():
+                    # Validate mod loader
                     loader = prof.get("modloader", "None")
                     if loader not in VALID_LOADER_NAMES:
                         prof["modloader"] = "None"
                         modified = True
+                    # Ensure account field exists
+                    if "account" not in prof:
+                        prof["account"] = None
+                        modified = True
+                    # Remove default_server if it exists (cleanup)
+                    if "default_server" in prof:
+                        del prof["default_server"]
+                        modified = True
+                    # Ensure other fields exist
                     for key in ["mods", "resource_packs", "jvm_args", "memory"]:
                         if key not in prof:
                             if key in ["mods", "resource_packs"]:
@@ -32,8 +42,7 @@ class ProfileManager:
                                 prof[key] = ""
                             modified = True
                 if modified:
-                    with open(self.profiles_path, "w") as f:
-                        json.dump(data, f, indent=2)
+                    self.save_profiles()
                 return data
             except:
                 return {}
@@ -43,6 +52,9 @@ class ProfileManager:
         for name, prof in self.profiles.items():
             if prof.get("modloader") not in VALID_LOADER_NAMES:
                 prof["modloader"] = "None"
+            # Remove default_server if present
+            if "default_server" in prof:
+                del prof["default_server"]
         with open(self.profiles_path, "w") as f:
             json.dump(self.profiles, f, indent=2)
 
@@ -53,7 +65,8 @@ class ProfileManager:
         return self.profiles.get(name, {})
 
     def add_profile(self, name, version, modloader="None", modloader_version="",
-                    mods=None, resource_packs=None, jvm_args="", memory="2048"):
+                    mods=None, resource_packs=None, jvm_args="", memory="2048",
+                    account=None):
         if name in self.profiles:
             return False
         if modloader not in VALID_LOADER_NAMES:
@@ -66,6 +79,7 @@ class ProfileManager:
             "resource_packs": resource_packs or [],
             "jvm_args": jvm_args,
             "memory": memory,
+            "account": account
         }
         self.save_profiles()
         (self.workdir / "instances" / name).mkdir(parents=True, exist_ok=True)
@@ -82,6 +96,9 @@ class ProfileManager:
         if name not in self.profiles:
             return False
         for key, val in kwargs.items():
+            # Skip default_server if accidentally passed
+            if key == "default_server":
+                continue
             if key in self.profiles[name]:
                 self.profiles[name][key] = val
         self.save_profiles()

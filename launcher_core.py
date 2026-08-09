@@ -10,11 +10,11 @@ import webbrowser
 import zipfile
 import json
 import requests
-import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from helpers import is_valid_jar, copy_file_with_retry
 from downloaders import download_fabric, download_quilt
+from io import BytesIO
 
 CHUNK_SIZE = 128 * 1024
 REQUEST_RETRIES = 3
@@ -31,10 +31,10 @@ def get_subprocess_kwargs():
     return {}
 
 class LauncherCore:
-    def __init__(self, workdir, profile_manager, settings_manager, log_func, progress_callback=None):
+    def __init__(self, workdir, profile_manager, account_manager, log_func, progress_callback=None):
         self.workdir = Path(workdir)
         self.profile_manager = profile_manager
-        self.settings_manager = settings_manager
+        self.account_manager = account_manager
         self.log = log_func
         self.progress = progress_callback
         self.java_download_dir = self.workdir / "java"
@@ -44,10 +44,128 @@ class LauncherCore:
         self.log(f"Launching {version} with {modloader} as '{username}'")
         threading.Thread(target=self._do_launch, args=(version, username, profile_name, modloader, modloader_version), daemon=True).start()
 
+    def _get_csl_jar_for_version(self, mc_version, loader):
+        """
+        Query the Modrinth API to find the best compatible CustomSkinLoader JAR
+        for the given Minecraft version and loader (Fabric or Quilt).
+        Returns (filename, download_url) or (None, None) if nothing found.
+        """
+        import urllib.parse
+        loader_name = loader.lower()  # "fabric" or "quilt"
+        url = (
+            "https://api.modrinth.com/v2/project/idMHQ4n2/version"
+            f"?loaders=%5B%22{loader_name}%22%5D"
+            f"&game_versions=%5B%22{urllib.parse.quote(mc_version)}%22%5D"
+        )
+        try:
+            resp = requests.get(url, timeout=10,
+                                headers={"User-Agent": "OpenLauncher/1.0"})
+            resp.raise_for_status()
+            versions = resp.json()
+        except Exception as e:
+            self.log(f"Modrinth API error querying CSL: {e}", "WARNING")
+            return None, None
+
+        if not versions:
+            # Fall back: try without strict game_version filter — take the
+            # latest release that lists our MC version in its game_versions.
+            try:
+                resp2 = requests.get(
+                    f"https://api.modrinth.com/v2/project/idMHQ4n2/version"
+                    f"?loaders=%5B%22{loader_name}%22%5D",
+                    timeout=10, headers={"User-Agent": "OpenLauncher/1.0"})
+                resp2.raise_for_status()
+                all_versions = resp2.json()
+                versions = [v for v in all_versions
+                            if mc_version in v.get("game_versions", [])]
+            except Exception as e:
+                self.log(f"Modrinth fallback query failed: {e}", "WARNING")
+                return None, None
+
+        if not versions:
+            return None, None
+
+        # Pick the first (newest) release; fall back to any version type.
+        chosen = next((v for v in versions if v.get("version_type") == "release"), versions[0])
+        for f in chosen.get("files", []):
+            if f.get("primary", False) or f.get("filename", "").endswith(".jar"):
+                return f["filename"], f["url"]
+        return None, None
+
+    def _ensure_csl_installed(self, instance_dir, mc_version, modloader):
+        """
+        Auto-install CustomSkinLoader into the instance mods folder if it isn't
+        already present.  Skips silently for vanilla (no mod loader).
+        """
+        if modloader == "None":
+            return  # CSL requires Fabric or Quilt
+
+        mods_dir = instance_dir / "mods"
+        mods_dir.mkdir(exist_ok=True)
+
+        # Already installed? (any CSL jar present)
+        existing = list(mods_dir.glob("CustomSkinLoader*.jar")) +                    list(mods_dir.glob("customskinloader*.jar"))
+        if existing:
+            self.log(f"CustomSkinLoader already installed: {existing[0].name}", "INFO")
+            return
+
+        self.log(f"Auto-installing CustomSkinLoader for {modloader} {mc_version}…")
+        filename, url = self._get_csl_jar_for_version(mc_version, modloader)
+        if not filename or not url:
+            self.log(
+                f"Could not find a CustomSkinLoader release for "
+                f"{modloader} {mc_version} on Modrinth.", "WARNING")
+            return
+
+        dest = mods_dir / filename
+        try:
+            r = requests.get(url, stream=True, timeout=60,
+                             headers={"User-Agent": "OpenLauncher/1.0"})
+            r.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(chunk_size=128 * 1024):
+                    if chunk:
+                        f.write(chunk)
+            if is_valid_jar(dest):
+                self.log(f"CustomSkinLoader installed: {filename}", "SUCCESS")
+                # Register in profile mods list so the UI shows it
+                profile = self.profile_manager.get_profile(
+                    instance_dir.name)  # profile_name == instance dir name
+                if profile is not None:
+                    mods = profile.get("mods", [])
+                    if str(dest) not in mods:
+                        mods.append(str(dest))
+                        self.profile_manager.update_profile(
+                            instance_dir.name, mods=mods)
+            else:
+                dest.unlink(missing_ok=True)
+                self.log("Downloaded CSL jar is corrupt, removed.", "WARNING")
+        except Exception as e:
+            self.log(f"Failed to download CustomSkinLoader: {e}", "ERROR")
+            if dest.exists():
+                dest.unlink(missing_ok=True)
+
+    def _deploy_csl_local_skin(self, instance_dir, username, skin_path):
+        """
+        Copy the skin PNG into CustomSkinLoader's LocalSkin folder.
+        CSL reads from: <game_dir>/CustomSkinLoader/LocalSkin/skins/<USERNAME>.png
+        Works fully offline with no config changes needed.
+        """
+        local_skin_dir = instance_dir / "CustomSkinLoader" / "LocalSkin" / "skins"
+        local_skin_dir.mkdir(parents=True, exist_ok=True)
+        dest = local_skin_dir / f"{username}.png"
+        try:
+            shutil.copy2(skin_path, dest)
+            self.log(f"Skin deployed to CSL LocalSkin: {dest}", "SUCCESS")
+        except Exception as e:
+            self.log(f"Failed to deploy skin to CSL LocalSkin: {e}", "ERROR")
+
+
     def _do_launch(self, version, username, profile_name, modloader, modloader_version):
         stdout_log = []
         stderr_log = []
         exit_code = 0
+
         try:
             profile = self.profile_manager.get_profile(profile_name)
             memory = int(profile.get("memory", "2048"))
@@ -101,10 +219,10 @@ class LauncherCore:
                 self.log(f"Client JAR missing or corrupt: {client_path}", "ERROR")
                 return
 
-            # --- Inject custom splash (with lock handling) ---
+            # --- Inject custom splash ---
             self._inject_splash_into_jar(client_path)
 
-            # Download assets (with retry)
+            # Download assets
             self._download_assets(version_json, assets_dir)
             vanilla_cp_entries_abs = self._download_libraries(version_json, libraries_dir, client_path)
             self._extract_natives(libraries_dir, natives_dir)
@@ -120,7 +238,11 @@ class LauncherCore:
                 else:
                     raise Exception(f"Unsupported mod loader: {modloader}")
 
-            # --- Build classpath with absolute paths first ---
+            # --- Auto-install CustomSkinLoader ---
+            if modloader != "None":
+                self._ensure_csl_installed(instance_dir, version, modloader)
+
+            # --- Classpath ---
             cp_entries_abs = []
             for entry in (modloader_cp_entries_abs + vanilla_cp_entries_abs):
                 if os.path.isfile(entry) and is_valid_jar(entry):
@@ -128,22 +250,19 @@ class LauncherCore:
                 elif os.path.isfile(entry):
                     self.log(f"Skipping corrupt jar: {entry}", "WARNING")
 
-            # --- Convert to relative paths (relative to instance_dir) ---
             cp_entries = []
             for entry in cp_entries_abs:
                 try:
                     rel = Path(entry).relative_to(instance_dir)
                     cp_entries.append(str(rel))
                 except ValueError:
-                    # If not under instance_dir, keep absolute
                     cp_entries.append(entry)
 
-            # --- Write classpath file with relative paths ---
             classpath_file = instance_dir / "classpath.txt"
             cp_str = os.pathsep.join(cp_entries)
             with open(classpath_file, "w", encoding="utf-8") as f:
                 f.write(cp_str)
-            self.log(f"Classpath written to {classpath_file} (length: {len(cp_str)} chars)", "INFO")
+            self.log(f"Classpath written to {classpath_file}", "INFO")
             cp_arg = f"@{classpath_file.absolute()}"
 
             subs = {
@@ -163,6 +282,7 @@ class LauncherCore:
                 "${version_type}": "release"
             }
 
+            # Build JVM args
             jvm_args = []
             if "arguments" in version_json and "jvm" in version_json["arguments"]:
                 for arg in version_json["arguments"]["jvm"]:
@@ -179,7 +299,7 @@ class LauncherCore:
             if custom_jvm:
                 jvm_args.extend(custom_jvm.split())
 
-            # --- Extra flags to suppress warnings ---
+            # Extra flags
             jvm_args.append("--add-exports=java.base/jdk.internal.misc=ALL-UNNAMED")
             jvm_args.append("--enable-native-access=ALL-UNNAMED")
             jvm_args.append("-Dorg.lwjgl.system.jemalloc.disable=true")
@@ -188,7 +308,6 @@ class LauncherCore:
             jvm_args.append("-XX:-PrintWarnings")
             jvm_args.append("-XX:+UnlockDiagnosticVMOptions")
             jvm_args.append("-XX:-DisplayVMOutputToStderr")
-
             jvm_args.append(f"-Djava.library.path={natives_dir}")
             jvm_args.append(f"-Dorg.lwjgl.librarypath={natives_dir}")
 
@@ -198,6 +317,7 @@ class LauncherCore:
                 jvm_args.append("-Dorg.lwjgl.opengl.Display.allowSoftwareOpenGL=true")
                 jvm_args.append("-Dorg.lwjgl.opengl.Window.allowSoftwareOpenGL=true")
 
+            # Build game args
             game_args = []
             if "arguments" in version_json and "game" in version_json["arguments"]:
                 for arg in version_json["arguments"]["game"]:
@@ -212,6 +332,16 @@ class LauncherCore:
                 for key, val in subs.items():
                     arg_str = arg_str.replace(key, val)
                 game_args = arg_str.split()
+
+            # ---------- SKIN INJECTION (CSL LocalSkin method) ----------
+            account_name = profile.get("account")
+            if account_name:
+                skin_path = self.account_manager.get_skin(account_name)
+                if skin_path and os.path.isfile(skin_path):
+                    self._deploy_csl_local_skin(instance_dir, username, skin_path)
+                else:
+                    self.log(f"No valid skin for account '{account_name}'.", "DEBUG")
+            # ---------------------------------------------------------------
 
             cmd = [java_path] + jvm_args + ["-cp", cp_arg, main_class] + game_args
 
@@ -240,7 +370,7 @@ class LauncherCore:
                 **kwargs
             )
 
-            # Capture all output for crash log
+            # Capture output
             stdout_full = []
             stderr_full = []
 
@@ -283,6 +413,7 @@ class LauncherCore:
 
     # ---------- Crash log saving ----------
     def _save_crash_log(self, instance_dir, stdout_log, stderr_log, exit_code):
+        import datetime
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         crash_file = instance_dir / f"crash_{timestamp}.log"
         with open(crash_file, "w", encoding="utf-8") as f:

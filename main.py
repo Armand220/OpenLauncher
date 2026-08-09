@@ -4,7 +4,7 @@
 import os
 import sys
 import tkinter as tk
-from tkinter import scrolledtext, messagebox, filedialog
+from tkinter import ttk, scrolledtext, messagebox, filedialog
 import customtkinter as ctk
 from pathlib import Path
 import shutil
@@ -13,9 +13,10 @@ import subprocess
 import re
 import platform
 import threading
+import datetime
 
 from profile_manager import ProfileManager
-from settings_manager import SettingsManager
+from account_manager import AccountManager
 from launcher_core import LauncherCore
 from ui_tabs import build_tabs
 
@@ -50,15 +51,13 @@ class OpenLauncherApp(ctk.CTk):
 
         self.workdir_var = tk.StringVar(value=os.path.join(os.getcwd(), "minecraft_offline"))
         self.profile_manager = ProfileManager(self.workdir_var.get())
-        self.settings_manager = SettingsManager(self.workdir_var.get())
+        self.account_manager = AccountManager(self.workdir_var.get())
 
         self.current_profile = None
         self.build_ui()
         self.refresh_profiles()
-        self.global_username_entry.delete(0, tk.END)
-        self.global_username_entry.insert(0, self.settings_manager.get_global_username())
+        self.refresh_accounts()
 
-        # Store reference to launcher core for crash callbacks
         self.launcher_core = None
 
     def build_ui(self):
@@ -72,11 +71,6 @@ class OpenLauncherApp(ctk.CTk):
 
         ctk.CTkButton(top_frame, text="Browse", width=80, height=30, corner_radius=8, fg_color=PURPLE, hover_color=PURPLE_DARK, command=self.browse_workdir).pack(side="left", padx=5)
 
-        ctk.CTkLabel(top_frame, text="Global Username:", font=ctk.CTkFont(size=13)).pack(side="left", padx=(20, 5))
-        self.global_username_entry = ctk.CTkEntry(top_frame, width=150, corner_radius=8, fg_color=BG_DARK, text_color=TEXT_LIGHT)
-        self.global_username_entry.pack(side="left", padx=5)
-
-        ctk.CTkButton(top_frame, text="Save", width=50, height=30, corner_radius=8, fg_color=PURPLE, hover_color=PURPLE_DARK, command=self.save_global_username).pack(side="left", padx=5)
         ctk.CTkButton(top_frame, text="Refresh", width=70, height=30, corner_radius=8, fg_color=PURPLE, hover_color=PURPLE_DARK, command=self.refresh_profiles).pack(side="left", padx=5)
 
         # Main row
@@ -90,23 +84,35 @@ class OpenLauncherApp(ctk.CTk):
         self.tabview = ctk.CTkTabview(left_frame, width=450, corner_radius=12, fg_color=BG_DARK, segmented_button_fg_color=BG_FRAME, segmented_button_selected_color=PURPLE, segmented_button_unselected_color=BG_DARK)
         self.tabview.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # Add tabs
         self.tabview.add("Mods")
         self.tabview.add("Resource Packs")
         self.tabview.add("Worlds")
         self.tabview.add("Java")
+        self.tabview.add("Accounts")
 
-        # Build UI tabs and get references
         self.ui_refs = build_tabs(self.tabview, self.profile_manager, self.workdir_var, self.log, self.refresh_profiles, self.get_selected_profile)
 
-        # RIGHT PANEL: Profiles
+        # Build Accounts tab
+        self.build_accounts_tab(self.tabview.tab("Accounts"))
+
+        # RIGHT PANEL: Profiles (simple Listbox)
         right_frame = ctk.CTkFrame(main_row, fg_color=BG_FRAME, corner_radius=16)
-        right_frame.pack(side="right", fill="both", expand=False, padx=(0, 0))
-        right_frame.configure(width=280)
+        right_frame.pack(side="right", fill="both", expand=True, padx=(0, 0))
 
         ctk.CTkLabel(right_frame, text="Profiles", font=ctk.CTkFont(size=15, weight="bold"), text_color=PURPLE_LIGHT).pack(pady=(10, 5), anchor="w", padx=15)
 
-        self.profile_listbox = tk.Listbox(right_frame, bg=BG_DARK, fg=TEXT_LIGHT, selectbackground=PURPLE, selectforeground="white", font=("Segoe UI", 11), relief="flat", borderwidth=0, highlightthickness=0, activestyle="none")
+        self.profile_listbox = tk.Listbox(
+            right_frame,
+            bg=BG_DARK,
+            fg=TEXT_LIGHT,
+            selectbackground=PURPLE,
+            selectforeground="white",
+            font=("Segoe UI", 11),
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            activestyle="none"
+        )
         self.profile_listbox.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.profile_listbox.bind("<Double-Button-1>", self.launch_selected)
         self.profile_listbox.bind("<<ListboxSelect>>", self.on_profile_selected)
@@ -142,12 +148,12 @@ class OpenLauncherApp(ctk.CTk):
         self.log_text.tag_configure('ERROR', foreground='#E74C3C')
         self.log_text.tag_configure('SUCCESS', foreground='#2ECC71')
 
-        # Initialise launcher core
+        # Initialise launcher core (pass account_manager)
         try:
             self.launcher_core = LauncherCore(
                 self.workdir_var.get(),
                 self.profile_manager,
-                self.settings_manager,
+                self.account_manager,
                 self.log,
                 self.update_progress
             )
@@ -155,7 +161,161 @@ class OpenLauncherApp(ctk.CTk):
             self.log(f"Failed to initialise LauncherCore: {e}", "ERROR")
             messagebox.showerror("Error", f"Could not initialise launcher core:\n{e}")
 
-    # ---------- Callbacks ----------
+    # ---------- Accounts tab ----------
+    def build_accounts_tab(self, parent):
+        ctk.CTkLabel(parent, text="Account Manager", font=ctk.CTkFont(size=16, weight="bold"), text_color=PURPLE_LIGHT).pack(anchor="w", padx=10, pady=(10,5))
+
+        self.accounts_listbox = tk.Listbox(parent, bg=BG_DARK, fg=TEXT_LIGHT, selectbackground=PURPLE, selectforeground="white", font=("Segoe UI", 11), relief="flat", borderwidth=0, highlightthickness=0, activestyle="none")
+        self.accounts_listbox.pack(fill="both", expand=True, padx=10, pady=5)
+        self.accounts_listbox.bind("<<ListboxSelect>>", self.on_account_selected)
+
+        # --- Skin selection frame ---
+        skin_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        skin_frame.pack(fill="x", padx=10, pady=5)
+        ctk.CTkLabel(skin_frame, text="Skin:", font=ctk.CTkFont(size=12)).pack(side="left", padx=5)
+        self.skin_label = ctk.CTkLabel(skin_frame, text="None selected", text_color=TEXT_DIM, width=250, anchor="w")
+        self.skin_label.pack(side="left", padx=5, fill="x", expand=True)
+        ctk.CTkButton(skin_frame, text="Select Skin (PNG)", corner_radius=8, fg_color=PURPLE, hover_color=PURPLE_DARK, command=self.select_skin).pack(side="right", padx=2)
+        ctk.CTkButton(skin_frame, text="Clear Skin", corner_radius=8, fg_color="#555", hover_color="#777", command=self.clear_skin).pack(side="right", padx=2)
+
+        # --- Account action buttons ---
+        btn_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=10, pady=5)
+        ctk.CTkButton(btn_frame, text="Add Account", corner_radius=8, fg_color=PURPLE, hover_color=PURPLE_DARK, command=self.add_account_dialog).pack(side="left", padx=2, expand=True, fill="x")
+        ctk.CTkButton(btn_frame, text="Remove Account", corner_radius=8, fg_color=PURPLE, hover_color=PURPLE_DARK, command=self.remove_account).pack(side="left", padx=2, expand=True, fill="x")
+        ctk.CTkButton(btn_frame, text="Rename Account", corner_radius=8, fg_color=PURPLE, hover_color=PURPLE_DARK, command=self.rename_account_dialog).pack(side="left", padx=2, expand=True, fill="x")
+
+        self.refresh_accounts()
+
+    def on_account_selected(self, event):
+        selection = self.accounts_listbox.curselection()
+        if not selection:
+            return
+        name = self.accounts_listbox.get(selection[0])
+        if name.startswith("No accounts"):
+            return
+        self.update_skin_display(name)
+
+    def update_skin_display(self, account_name):
+        if not account_name:
+            self.skin_label.configure(text="None selected")
+            return
+        skin_path = self.account_manager.get_skin(account_name)
+        if skin_path and os.path.exists(skin_path):
+            self.skin_label.configure(text=os.path.basename(skin_path), text_color=TEXT_LIGHT)
+        else:
+            self.skin_label.configure(text="None selected", text_color=TEXT_DIM)
+
+    def select_skin(self):
+        selection = self.accounts_listbox.curselection()
+        if not selection:
+            messagebox.showinfo("No Account", "Select an account first.")
+            return
+        name = self.accounts_listbox.get(selection[0])
+        if name.startswith("No accounts"):
+            return
+
+        file_path = filedialog.askopenfilename(
+            title="Select Skin PNG",
+            filetypes=[("PNG images", "*.png"), ("All files", "*.*")]
+        )
+        if not file_path:
+            return
+
+        # Basic validation: check PNG signature
+        try:
+            with open(file_path, "rb") as f:
+                header = f.read(8)
+                if header != b'\x89PNG\r\n\x1a\n':
+                    messagebox.showerror("Invalid File", "The selected file is not a valid PNG image.")
+                    return
+        except Exception as e:
+            messagebox.showerror("Error", f"Cannot read file: {e}")
+            return
+
+        # Copy to a dedicated skins folder under the workdir
+        skin_root = Path(self.workdir_var.get()) / "accounts" / "skins"
+        skin_root.mkdir(parents=True, exist_ok=True)
+        # Sanitise account name for filename
+        safe_name = "".join(c for c in name if c.isalnum() or c in "._-")
+        dest = skin_root / f"{safe_name}.png"
+        try:
+            shutil.copy2(file_path, dest)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to copy skin: {e}")
+            return
+
+        if self.account_manager.set_skin(name, str(dest)):
+            self.refresh_accounts()  # refresh list to update internal state
+            self.update_skin_display(name)
+            self.log(f"Skin set for account '{name}'", "SUCCESS")
+        else:
+            messagebox.showerror("Error", "Could not update account record.")
+
+    def clear_skin(self):
+        selection = self.accounts_listbox.curselection()
+        if not selection:
+            return
+        name = self.accounts_listbox.get(selection[0])
+        if name.startswith("No accounts"):
+            return
+        if messagebox.askyesno("Clear Skin", f"Remove the stored skin for '{name}'?"):
+            if self.account_manager.set_skin(name, None):
+                self.refresh_accounts()
+                self.update_skin_display(name)
+                self.log(f"Skin cleared for account '{name}'", "INFO")
+
+    def refresh_accounts(self):
+        self.account_manager = AccountManager(self.workdir_var.get())
+        self.accounts_listbox.delete(0, tk.END)
+        for acc in self.account_manager.get_account_names():
+            self.accounts_listbox.insert(tk.END, acc)
+        if self.accounts_listbox.size() == 0:
+            self.accounts_listbox.insert(tk.END, "No accounts. Click 'Add Account'.")
+        else:
+            # Auto-select first account and update skin display
+            self.accounts_listbox.selection_set(0)
+            self.on_account_selected(None)
+
+    def add_account_dialog(self):
+        name = ctk.CTkInputDialog(title="Add Account", text="Enter account name (username):").get_input()
+        if not name:
+            return
+        if self.account_manager.add_account(name):
+            self.refresh_accounts()
+            self.log(f"Account '{name}' added.", "SUCCESS")
+        else:
+            messagebox.showerror("Error", f"Account '{name}' already exists.")
+
+    def remove_account(self):
+        selection = self.accounts_listbox.curselection()
+        if not selection:
+            return
+        name = self.accounts_listbox.get(selection[0])
+        if name == "No accounts. Click 'Add Account'.":
+            return
+        if messagebox.askyesno("Confirm", f"Remove account '{name}'?"):
+            self.account_manager.remove_account(name)
+            self.refresh_accounts()
+            self.log(f"Account '{name}' removed.", "INFO")
+
+    def rename_account_dialog(self):
+        selection = self.accounts_listbox.curselection()
+        if not selection:
+            return
+        old_name = self.accounts_listbox.get(selection[0])
+        if old_name == "No accounts. Click 'Add Account'.":
+            return
+        new_name = ctk.CTkInputDialog(title="Rename Account", text=f"Rename '{old_name}' to:").get_input()
+        if not new_name or new_name == old_name:
+            return
+        if self.account_manager.rename_account(old_name, new_name):
+            self.refresh_accounts()
+            self.log(f"Account renamed from '{old_name}' to '{new_name}'.", "SUCCESS")
+        else:
+            messagebox.showerror("Error", "Rename failed.")
+
+    # ---------- Profile list handling ----------
     def get_selected_profile(self):
         selection = self.profile_listbox.curselection()
         if not selection:
@@ -181,6 +341,8 @@ class OpenLauncherApp(ctk.CTk):
         if name:
             self.current_profile = name
             self.update_ui_for_profile(name)
+        else:
+            self.update_ui_for_profile(None)
 
     def update_ui_for_profile(self, profile_name):
         if not profile_name:
@@ -217,10 +379,9 @@ class OpenLauncherApp(ctk.CTk):
         self.ui_refs["jvm_args_entry"].delete(0, tk.END)
         self.ui_refs["jvm_args_entry"].insert(0, profile.get("jvm_args", ""))
 
-    # ---------- Progress callback (handles crash events) ----------
+    # ---------- Progress callback ----------
     def update_progress(self, value, text):
         if isinstance(text, tuple) and text[0] == "crash":
-            # Crash event from launcher core
             _, exit_code, instance_dir, crash_file = text
             self.after(0, lambda: self.show_crash_dialog(exit_code, instance_dir, crash_file))
             return
@@ -229,7 +390,6 @@ class OpenLauncherApp(ctk.CTk):
         if text:
             self.progress_label.configure(text=text)
 
-    # ---------- Crash dialog ----------
     def show_crash_dialog(self, exit_code, instance_dir, crash_file):
         preview = ""
         if crash_file and os.path.exists(crash_file):
@@ -290,12 +450,6 @@ class OpenLauncherApp(ctk.CTk):
             f.write(f"[{level}] {message}\n")
 
     # ---------- Top bar actions ----------
-    def save_global_username(self):
-        name = self.global_username_entry.get().strip()
-        self.settings_manager.set_global_username(name)
-        self.log(f"Global username set to '{name}'", "SUCCESS")
-        messagebox.showinfo("Saved", f"Global username updated to '{name}'")
-
     def browse_workdir(self):
         folder = filedialog.askdirectory(title="Select Minecraft work directory")
         if not folder:
@@ -313,15 +467,14 @@ class OpenLauncherApp(ctk.CTk):
                 return
         self.workdir_var.set(folder)
         self.profile_manager = ProfileManager(folder)
-        self.settings_manager = SettingsManager(folder)
+        self.account_manager = AccountManager(folder)
         self.refresh_profiles()
-        self.global_username_entry.delete(0, tk.END)
-        self.global_username_entry.insert(0, self.settings_manager.get_global_username())
+        self.refresh_accounts()
         try:
             self.launcher_core = LauncherCore(
                 folder,
                 self.profile_manager,
-                self.settings_manager,
+                self.account_manager,
                 self.log,
                 self.update_progress
             )
@@ -334,7 +487,7 @@ class OpenLauncherApp(ctk.CTk):
     def add_profile_dialog(self):
         dialog = ctk.CTkToplevel(self)
         dialog.title("Add Profile")
-        dialog.geometry("460x320")
+        dialog.geometry("500x380")
         dialog.resizable(False, False)
         dialog.configure(fg_color=BG_DARK)
         dialog.grab_set()
@@ -362,15 +515,25 @@ class OpenLauncherApp(ctk.CTk):
         version_e.grid(row=row, column=1, padx=5, pady=10, sticky="w")
         row += 1
 
+        ctk.CTkLabel(dialog, text="Account:").grid(row=row, column=0, padx=15, pady=10, sticky="w")
+        account_var = tk.StringVar(value="Default")
+        account_names = self.account_manager.get_account_names()
+        account_menu = ctk.CTkComboBox(dialog, values=["Default"] + account_names, variable=account_var, width=200)
+        account_menu.grid(row=row, column=1, padx=5, pady=10, sticky="w")
+        row += 1
+
         def do_add():
             n = name_e.get().strip()
             v = ver_e.get().strip()
             loader = loader_var.get()
             loader_ver = version_e.get().strip()
+            account = account_var.get()
+            if account == "Default":
+                account = None
             if not n or not v:
                 messagebox.showerror("Error", "Name and Version are required.")
                 return
-            if self.profile_manager.add_profile(n, v, loader, loader_ver):
+            if self.profile_manager.add_profile(n, v, loader, loader_ver, account=account):
                 self.refresh_profiles()
                 dialog.destroy()
                 self.log(f"Profile '{n}' added with loader {loader}.", "SUCCESS")
@@ -390,7 +553,7 @@ class OpenLauncherApp(ctk.CTk):
         current_loader = profile.get("modloader", "None")
         dialog = ctk.CTkToplevel(self)
         dialog.title(f"Edit Profile: {name}")
-        dialog.geometry("480x340")
+        dialog.geometry("520x430")
         dialog.resizable(False, False)
         dialog.configure(fg_color=BG_DARK)
         dialog.grab_set()
@@ -432,10 +595,8 @@ class OpenLauncherApp(ctk.CTk):
             p = filedialog.askopenfilename(title="Select java", filetypes=[("Java", "java.exe"), ("Java", "java")])
             if not p:
                 return
-            # Get required Java version
             mc_version = ver_e.get().strip()
             required_major = self._get_required_java_version(mc_version)
-
             try:
                 startupinfo = None
                 creationflags = 0
@@ -489,12 +650,22 @@ class OpenLauncherApp(ctk.CTk):
         ctk.CTkButton(dialog, text="Browse", width=70, height=28, corner_radius=8, fg_color=PURPLE, hover_color=PURPLE_DARK, command=browse_java).grid(row=row, column=2, padx=5, pady=10)
         row += 1
 
+        ctk.CTkLabel(dialog, text="Account:").grid(row=row, column=0, padx=15, pady=10, sticky="w")
+        account_names = self.account_manager.get_account_names()
+        account_var = tk.StringVar(value=profile.get("account") or "Default")
+        account_menu = ctk.CTkComboBox(dialog, values=["Default"] + account_names, variable=account_var, width=200)
+        account_menu.grid(row=row, column=1, padx=5, pady=10, sticky="w")
+        row += 1
+
         def do_update():
             nn = name_e.get().strip()
             vv = ver_e.get().strip()
             loader = loader_var.get()
             loader_ver = version_e.get().strip()
             jj = java_e.get().strip()
+            account = account_var.get()
+            if account == "Default":
+                account = None
             if not nn or not vv:
                 messagebox.showerror("Error", "Name and Version required.")
                 return
@@ -502,7 +673,7 @@ class OpenLauncherApp(ctk.CTk):
                 loader = "None"
 
             if nn != name:
-                if self.profile_manager.add_profile(nn, vv, loader, loader_ver, mods=profile.get("mods", []), resource_packs=profile.get("resource_packs", []), jvm_args=profile.get("jvm_args", ""), memory=profile.get("memory", "2048")):
+                if self.profile_manager.add_profile(nn, vv, loader, loader_ver, mods=profile.get("mods", []), resource_packs=profile.get("resource_packs", []), jvm_args=profile.get("jvm_args", ""), memory=profile.get("memory", "2048"), account=account):
                     if jj:
                         self.profile_manager.update_profile(nn, java_path=jj)
                     self.profile_manager.delete_profile(name)
@@ -514,7 +685,7 @@ class OpenLauncherApp(ctk.CTk):
                     messagebox.showerror("Error", f"Could not rename to '{nn}'. The name may already exist.")
                     return
             else:
-                if self.profile_manager.update_profile(name, version=vv, modloader=loader, modloader_version=loader_ver, java_path=jj):
+                if self.profile_manager.update_profile(name, version=vv, modloader=loader, modloader_version=loader_ver, java_path=jj, account=account):
                     self.refresh_profiles()
                     dialog.destroy()
                     self.log(f"Profile '{name}' updated.", "SUCCESS")
@@ -570,16 +741,14 @@ class OpenLauncherApp(ctk.CTk):
             else:
                 messagebox.showerror("Error", "Delete failed.")
 
-    # ---------- FIXED: Launch method with fallback ----------
     def launch_selected(self, event=None):
         try:
-            # Ensure launcher_core is initialised
             if self.launcher_core is None:
                 self.log("LauncherCore not initialised – recreating.", "WARNING")
                 self.launcher_core = LauncherCore(
                     self.workdir_var.get(),
                     self.profile_manager,
-                    self.settings_manager,
+                    self.account_manager,
                     self.log,
                     self.update_progress
                 )
@@ -606,8 +775,10 @@ class OpenLauncherApp(ctk.CTk):
                 messagebox.showerror("Error", "Profile missing version.")
                 return
 
-            username = self.settings_manager.get_global_username()
-            if not username or not username.strip():
+            profile_account = profile.get("account")
+            if profile_account:
+                username = profile_account
+            else:
                 username = DEFAULT_USERNAME
 
             self.launcher_core.launch(version, username, name, modloader, modloader_version)
