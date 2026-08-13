@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 PROFILES_FILE = "profiles.json"
-VALID_LOADER_NAMES = {"None", "Fabric", "Quilt"}
+VALID_LOADER_NAMES = {"None", "Fabric", "Quilt", "Forge"}
 
 class ProfileManager:
     def __init__(self, workdir):
@@ -32,17 +32,23 @@ class ProfileManager:
                         del prof["default_server"]
                         modified = True
                     # Ensure other fields exist
-                    for key in ["mods", "resource_packs", "jvm_args", "memory"]:
+                    for key in ["mods", "resource_packs", "jvm_args", "memory", "notes", "play_time_seconds"]:
                         if key not in prof:
                             if key in ["mods", "resource_packs"]:
                                 prof[key] = []
                             elif key == "memory":
                                 prof[key] = "2048"
+                            elif key == "play_time_seconds":
+                                prof[key] = 0
                             else:
                                 prof[key] = ""
                             modified = True
                 if modified:
-                    self.save_profiles()
+                    try:
+                        with open(self.profiles_path, "w") as f:
+                            json.dump(data, f, indent=2)
+                    except Exception:
+                        pass
                 return data
             except:
                 return {}
@@ -66,7 +72,7 @@ class ProfileManager:
 
     def add_profile(self, name, version, modloader="None", modloader_version="",
                     mods=None, resource_packs=None, jvm_args="", memory="2048",
-                    account=None):
+                    account=None, notes=""):
         if name in self.profiles:
             return False
         if modloader not in VALID_LOADER_NAMES:
@@ -79,7 +85,9 @@ class ProfileManager:
             "resource_packs": resource_packs or [],
             "jvm_args": jvm_args,
             "memory": memory,
-            "account": account
+            "account": account,
+            "notes": notes,
+            "play_time_seconds": 0
         }
         self.save_profiles()
         (self.workdir / "instances" / name).mkdir(parents=True, exist_ok=True)
@@ -96,10 +104,8 @@ class ProfileManager:
         if name not in self.profiles:
             return False
         for key, val in kwargs.items():
-            # Skip default_server if accidentally passed
             if key == "default_server":
                 continue
-            if key in self.profiles[name]:
-                self.profiles[name][key] = val
+            self.profiles[name][key] = val
         self.save_profiles()
         return True

@@ -6,15 +6,20 @@ import shutil
 import time
 import os
 import zipfile
+import threading
+import requests
 from helpers import copy_file_with_retry
 
-PURPLE = "#9B59B6"
-PURPLE_DARK = "#6C3483"
+PURPLE       = "#9B59B6"
+PURPLE_DARK  = "#6C3483"
 PURPLE_LIGHT = "#A569BD"
-BG_DARK = "#1E1E1E"
-BG_FRAME = "#2D2D2D"
-TEXT_LIGHT = "#E0E0E0"
-TEXT_DIM = "#A0A0A0"
+PURPLE_GLOW  = "#C39BD3"
+BG_DARK      = "#141414"
+BG_FRAME     = "#1E1E1E"
+BG_CARD      = "#252525"
+BORDER_COLOR = "#333333"
+TEXT_LIGHT   = "#E8E8E8"
+TEXT_DIM     = "#888888"
 
 def build_tabs(tabview, profile_manager, workdir_var, log_func, refresh_callback, get_selected_profile):
     """Build all tabs and return references to UI elements that need dynamic updates."""
@@ -23,8 +28,8 @@ def build_tabs(tabview, profile_manager, workdir_var, log_func, refresh_callback
     # ----- MODS TAB -----
     mods_tab = tabview.tab("Mods")
     ctk.CTkLabel(mods_tab, text="Mod Manager", font=ctk.CTkFont(size=16, weight="bold"), text_color=PURPLE_LIGHT).pack(anchor="w", padx=10, pady=(10,5))
-    mods_listbox = tk.Listbox(mods_tab, bg=BG_DARK, fg=TEXT_LIGHT, selectbackground=PURPLE, selectforeground="white", font=("Segoe UI", 11), relief="flat", borderwidth=0, highlightthickness=0, activestyle="none")
-    mods_listbox.pack(fill="both", expand=True, padx=10, pady=5)
+    mods_listbox = tk.Listbox(mods_tab, bg=BG_DARK, fg=TEXT_LIGHT, selectbackground=PURPLE, selectforeground="white", font=("Segoe UI", 11), relief="flat", borderwidth=0, highlightthickness=0, activestyle="none", height=4)
+    mods_listbox.pack(fill="x", padx=10, pady=5)
 
     def add_mod():
         profile_name = get_selected_profile()
@@ -81,6 +86,149 @@ def build_tabs(tabview, profile_manager, workdir_var, log_func, refresh_callback
     mod_btn_frame.pack(fill="x", padx=10, pady=5)
     ctk.CTkButton(mod_btn_frame, text="Add Mod (JAR)", corner_radius=8, fg_color=PURPLE, hover_color=PURPLE_DARK, command=add_mod).pack(side="left", padx=2, expand=True, fill="x")
     ctk.CTkButton(mod_btn_frame, text="Remove Mod", corner_radius=8, fg_color=PURPLE, hover_color=PURPLE_DARK, command=remove_mod).pack(side="right", padx=2, expand=True, fill="x")
+
+    # ----- Modrinth search -----
+    ctk.CTkLabel(mods_tab, text="Search Modrinth", font=ctk.CTkFont(size=13, weight="bold"),
+                 text_color=PURPLE_LIGHT).pack(anchor="w", padx=10, pady=(10, 2))
+
+    search_frame = ctk.CTkFrame(mods_tab, fg_color="transparent")
+    search_frame.pack(fill="x", padx=10, pady=(0, 4))
+    search_entry = ctk.CTkEntry(search_frame, placeholder_text="Search mods...",
+                                corner_radius=8, fg_color=BG_DARK, text_color=TEXT_LIGHT)
+    search_entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+    search_status = ctk.CTkLabel(search_frame, text="", font=ctk.CTkFont(size=10),
+                                  text_color=TEXT_DIM, width=60)
+    search_status.pack(side="right")
+
+    results_listbox = tk.Listbox(mods_tab, bg=BG_DARK, fg=TEXT_LIGHT,
+                                  selectbackground=PURPLE, selectforeground="white",
+                                  font=("Segoe UI", 10), relief="flat", borderwidth=0,
+                                  highlightthickness=0, activestyle="none", height=4)
+    results_listbox.pack(fill="x", padx=10, pady=(0, 4))
+
+    _search_results = []
+
+    def do_search():
+        query = search_entry.get().strip()
+        if not query:
+            return
+        profile_name = get_selected_profile()
+        mc_version = ""
+        if profile_name:
+            prof = profile_manager.get_profile(profile_name)
+            mc_version = prof.get("version", "") if prof else ""
+
+        search_status.configure(text="Searching...")
+        results_listbox.delete(0, tk.END)
+        _search_results.clear()
+
+        def _run():
+            try:
+                facets = '[["project_type:mod"]]'
+                if mc_version:
+                    facets = f'[["project_type:mod"],["versions:{mc_version}"]]'
+                resp = requests.get(
+                    "https://api.modrinth.com/v2/search",
+                    params={"query": query, "facets": facets, "limit": 12},
+                    headers={"User-Agent": "OpenLauncher/1.0"},
+                    timeout=10
+                )
+                resp.raise_for_status()
+                hits = resp.json().get("hits", [])
+                mods_tab.after(0, lambda: _populate(hits))
+            except Exception as e:
+                mods_tab.after(0, lambda: search_status.configure(text="Error"))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _populate(hits):
+        results_listbox.delete(0, tk.END)
+        _search_results.clear()
+        for h in hits:
+            _search_results.append(h)
+            dl = h.get("downloads", 0)
+            dl_str = f"{dl // 1000}k" if dl >= 1000 else str(dl)
+            results_listbox.insert(tk.END, f"  {h['title']}  ({dl_str} downloads)")
+        search_status.configure(text=f"{len(hits)} found")
+
+    search_entry.bind("<Return>", lambda e: do_search())
+    ctk.CTkButton(search_frame, text="Search", width=70, corner_radius=8,
+                  fg_color=PURPLE, hover_color=PURPLE_DARK,
+                  command=do_search).pack(side="left")
+
+    def install_mod():
+        sel = results_listbox.curselection()
+        if not sel:
+            messagebox.showinfo("No Selection", "Select a mod from the search results first.")
+            return
+        profile_name = get_selected_profile()
+        if not profile_name:
+            messagebox.showinfo("No Profile", "Select a profile first.")
+            return
+        hit = _search_results[sel[0]]
+        project_id = hit["project_id"]
+        search_status.configure(text="Fetching...")
+
+        def _fetch_and_install():
+            try:
+                prof = profile_manager.get_profile(profile_name)
+                mc_version = prof.get("version", "") if prof else ""
+                loader = (prof.get("modloader", "None") if prof else "None").lower()
+                params = {}
+                if mc_version:
+                    params["game_versions"] = f'["{mc_version}"]'
+                if loader != "none":
+                    params["loaders"] = f'["{loader}"]'
+                resp = requests.get(
+                    f"https://api.modrinth.com/v2/project/{project_id}/version",
+                    params=params,
+                    headers={"User-Agent": "OpenLauncher/1.0"},
+                    timeout=10
+                )
+                resp.raise_for_status()
+                versions = resp.json()
+                if not versions:
+                    mods_tab.after(0, lambda: search_status.configure(text="No compatible version"))
+                    return
+                chosen = next((v for v in versions if v.get("version_type") == "release"), versions[0])
+                file_info = next((f for f in chosen.get("files", []) if f.get("primary")),
+                                  chosen.get("files", [{}])[0])
+                url = file_info.get("url")
+                filename = file_info.get("filename", f"{project_id}.jar")
+                if not url:
+                    mods_tab.after(0, lambda: search_status.configure(text="No download URL"))
+                    return
+                instance_dir = Path(workdir_var.get()) / "instances" / profile_name / "mods"
+                instance_dir.mkdir(parents=True, exist_ok=True)
+                dest = instance_dir / filename
+                r = requests.get(url, stream=True, timeout=60, headers={"User-Agent": "OpenLauncher/1.0"})
+                r.raise_for_status()
+                with open(dest, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=128 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                mods = prof.get("mods", [])
+                if str(dest) not in mods:
+                    mods.append(str(dest))
+                    profile_manager.update_profile(profile_name, mods=mods)
+                mods_tab.after(0, lambda: (
+                    log_func(f"Installed: {filename}", "SUCCESS"),
+                    refresh_callback(),
+                    search_status.configure(text="Installed")
+                ))
+            except Exception as e:
+                mods_tab.after(0, lambda: (
+                    log_func(f"Install failed: {e}", "ERROR"),
+                    search_status.configure(text="Failed")
+                ))
+
+        threading.Thread(target=_fetch_and_install, daemon=True).start()
+
+    ctk.CTkButton(mods_tab, text="Install Selected Mod", corner_radius=8,
+                  fg_color=PURPLE, hover_color=PURPLE_DARK,
+                  command=install_mod).pack(fill="x", padx=10, pady=(0, 6))
+
     ui_refs["mods_listbox"] = mods_listbox
 
     # ----- RESOURCE PACKS TAB -----

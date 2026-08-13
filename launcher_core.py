@@ -13,21 +13,29 @@ import requests
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from helpers import is_valid_jar, copy_file_with_retry
-from downloaders import download_fabric, download_quilt
+from downloaders import download_fabric, download_quilt, download_forge
 from io import BytesIO
 
 CHUNK_SIZE = 128 * 1024
 REQUEST_RETRIES = 3
 MAX_WORKERS = 20
 
-def get_subprocess_kwargs():
+
+def get_subprocess_kwargs(hide_window=True):
     if platform.system() == "Windows":
         startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        return {
-            "startupinfo": startupinfo,
-            "creationflags": subprocess.CREATE_NO_WINDOW,
-        }
+        if hide_window:
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0  # SW_HIDE
+            return {
+                "startupinfo": startupinfo,
+                "creationflags": subprocess.CREATE_NO_WINDOW,
+            }
+        else:
+            # For GUI processes (Minecraft): do not hide, show normally
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 1  # SW_SHOW
+            return {"startupinfo": startupinfo}
     return {}
 
 class LauncherCore:
@@ -39,10 +47,62 @@ class LauncherCore:
         self.progress = progress_callback
         self.java_download_dir = self.workdir / "java"
         self.java_download_dir.mkdir(parents=True, exist_ok=True)
+        self._mc_process = None
 
     def launch(self, version, username, profile_name, modloader, modloader_version):
         self.log(f"Launching {version} with {modloader} as '{username}'")
         threading.Thread(target=self._do_launch, args=(version, username, profile_name, modloader, modloader_version), daemon=True).start()
+
+    def stop(self):
+        if self._mc_process:
+            try:
+                self._mc_process.terminate()
+                self.log("Terminate signal sent to Minecraft.", "WARNING")
+            except Exception as e:
+                self.log(f"Could not terminate Minecraft: {e}", "ERROR")
+
+    def repair_instance(self, version, profile_name):
+        self.log(f"Starting repair for '{profile_name}' ({version})...", "INFO")
+        threading.Thread(target=self._do_repair, args=(version, profile_name), daemon=True).start()
+
+    def _do_repair(self, version, profile_name):
+        try:
+            instance_dir = self.workdir / "instances" / profile_name
+            versions_dir = instance_dir / "versions"
+            libraries_dir = instance_dir / "libraries"
+            natives_dir = instance_dir / "natives"
+            for d in [versions_dir, libraries_dir, natives_dir]:
+                d.mkdir(parents=True, exist_ok=True)
+
+            manifest = self._fetch_manifest()
+            if not manifest:
+                self.log("Repair failed: could not fetch manifest.", "ERROR")
+                return
+            version_info = next((v for v in manifest["versions"] if v["id"] == version), None)
+            if not version_info:
+                self.log(f"Repair failed: version {version} not found.", "ERROR")
+                return
+            version_json = self._fetch_version_json(version_info["url"])
+            if not version_json:
+                self.log("Repair failed: could not fetch version JSON.", "ERROR")
+                return
+
+            client_path = versions_dir / f"{version}.jar"
+            if client_path.exists():
+                client_path.unlink()
+            self.log("Re-downloading client JAR...", "INFO")
+            self._download_file(version_json["downloads"]["client"]["url"], client_path, silent=True)
+
+            self.log("Re-downloading libraries...", "INFO")
+            self._download_libraries(version_json, libraries_dir, client_path)
+            self._extract_natives(libraries_dir, natives_dir)
+
+            self.log(f"Repair complete for '{profile_name}'.", "SUCCESS")
+        except Exception as e:
+            self.log(f"Repair failed: {e}", "ERROR")
+        finally:
+            if self.progress:
+                self.progress(0, "Ready")
 
     def _get_csl_jar_for_version(self, mc_version, loader):
         """
@@ -145,14 +205,118 @@ class LauncherCore:
             if dest.exists():
                 dest.unlink(missing_ok=True)
 
+    def _get_pack_format(self, mc_version):
+        """Return the resource-pack format number for a Minecraft version string."""
+        try:
+            parts = mc_version.split(".")
+            major = int(parts[1]) if len(parts) > 1 else 0
+            minor = int(parts[2]) if len(parts) > 2 else 0
+        except Exception:
+            return 8
+        if major <= 8:   return 1
+        if major <= 10:  return 2
+        if major <= 12:  return 3
+        if major <= 14:  return 4
+        if major == 15 or (major == 16 and minor <= 1): return 5
+        if major == 16:  return 6
+        if major == 17:  return 7
+        if major == 18:  return 8
+        if major == 19 and minor <= 2: return 9
+        if major == 19 and minor == 3: return 11
+        if major == 19:  return 12
+        if major == 20 and minor <= 1: return 13
+        if major == 20 and minor == 2: return 15
+        if major == 20 and minor <= 4: return 18
+        if major == 20:  return 22
+        if major == 21 and minor <= 1: return 32
+        if major == 21 and minor <= 3: return 34
+        return 36
+
+    def _inject_skin_resourcepack(self, instance_dir, skin_path, mc_version):
+        """Write a resource pack containing the user's skin and activate it in options.txt.
+        Returns True on success."""
+        rp_dir = instance_dir / "resourcepacks"
+        rp_dir.mkdir(exist_ok=True)
+        rp_path = rp_dir / "OpenLauncher_Skin.zip"
+        pack_format = self._get_pack_format(mc_version)
+
+        try:
+            with open(skin_path, "rb") as f:
+                skin_data = f.read()
+
+            with zipfile.ZipFile(rp_path, "w", compression=zipfile.ZIP_STORED) as z:
+                mcmeta = {"pack": {"pack_format": pack_format, "description": "Custom skin"}}
+                z.writestr("pack.mcmeta", json.dumps(mcmeta))
+                # 1.9+ wide (Steve) and slim (Alex) model paths
+                z.writestr("assets/minecraft/textures/entity/player/wide/steve.png", skin_data)
+                z.writestr("assets/minecraft/textures/entity/player/wide/alex.png", skin_data)
+                z.writestr("assets/minecraft/textures/entity/player/slim/steve.png", skin_data)
+                z.writestr("assets/minecraft/textures/entity/player/slim/alex.png", skin_data)
+                # 1.8 and below legacy paths
+                z.writestr("assets/minecraft/textures/entity/steve.png", skin_data)
+                z.writestr("assets/minecraft/textures/entity/alex.png", skin_data)
+                z.writestr("assets/minecraft/textures/entity/char.png", skin_data)
+
+            self._enable_resourcepack_in_options(instance_dir / "options.txt",
+                                                 "file/OpenLauncher_Skin.zip")
+            self.log("Skin resource pack created and activated.", "SUCCESS")
+            return True
+        except Exception as e:
+            self.log(f"Skin resource pack failed: {e}", "WARNING")
+            return False
+
+    def _enable_resourcepack_in_options(self, options_path, pack_name):
+        """Add pack_name to resourcePacks and incompatibleResourcePacks in options.txt."""
+        lines = []
+        indices = {}  # key -> line index
+        packs = {}    # key -> list
+
+        keys = ("resourcePacks", "incompatibleResourcePacks")
+
+        if options_path.exists():
+            with open(options_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            for i, line in enumerate(lines):
+                for key in keys:
+                    if line.startswith(key + ":"):
+                        indices[key] = i
+                        try:
+                            packs[key] = json.loads(line[len(key) + 1:].strip())
+                        except Exception:
+                            packs[key] = []
+
+        for key in keys:
+            lst = packs.get(key, [])
+            if pack_name not in lst:
+                lst.append(pack_name)
+            new_line = f"{key}:{json.dumps(lst)}\n"
+            if key in indices:
+                lines[indices[key]] = new_line
+            else:
+                lines.append(new_line)
+
+        with open(options_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+
     def _deploy_csl_local_skin(self, instance_dir, username, skin_path):
-        """
-        Copy the skin PNG into CustomSkinLoader's LocalSkin folder.
-        CSL reads from: <game_dir>/CustomSkinLoader/LocalSkin/skins/<USERNAME>.png
-        Works fully offline with no config changes needed.
-        """
-        local_skin_dir = instance_dir / "CustomSkinLoader" / "LocalSkin" / "skins"
+        csl_dir = instance_dir / "CustomSkinLoader"
+        local_skin_dir = csl_dir / "LocalSkin" / "skins"
         local_skin_dir.mkdir(parents=True, exist_ok=True)
+
+        # Write CSL config to use LocalSkin as the skin source
+        config_path = csl_dir / "CustomSkinLoader.json"
+        csl_config = {
+            "enable": True,
+            "loadlist": [
+                {"name": "LocalSkin", "type": "LocalSkin"}
+            ]
+        }
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(csl_config, f, indent=2)
+        except Exception as e:
+            self.log(f"Failed to write CSL config: {e}", "WARNING")
+
         dest = local_skin_dir / f"{username}.png"
         try:
             shutil.copy2(skin_path, dest)
@@ -169,6 +333,29 @@ class LauncherCore:
         try:
             profile = self.profile_manager.get_profile(profile_name)
             memory = int(profile.get("memory", "2048"))
+            try:
+                import ctypes as _ctypes
+                class _MEMSTATUS(_ctypes.Structure):
+                    _fields_ = [("dwLength", _ctypes.c_ulong),
+                                ("dwMemoryLoad", _ctypes.c_ulong),
+                                ("ullTotalPhys", _ctypes.c_ulonglong),
+                                ("ullAvailPhys", _ctypes.c_ulonglong),
+                                ("ullTotalPageFile", _ctypes.c_ulonglong),
+                                ("ullAvailPageFile", _ctypes.c_ulonglong),
+                                ("ullTotalVirtual", _ctypes.c_ulonglong),
+                                ("ullAvailVirtual", _ctypes.c_ulonglong),
+                                ("ullAvailExtendedVirtual", _ctypes.c_ulonglong)]
+                _ms = _MEMSTATUS()
+                _ms.dwLength = _ctypes.sizeof(_MEMSTATUS)
+                _ctypes.windll.kernel32.GlobalMemoryStatusEx(_ctypes.byref(_ms))
+                _available_mb = _ms.ullAvailPhys // (1024 * 1024)
+            except Exception:
+                _available_mb = None
+            if _available_mb is not None:
+                _cap_mb = int(_available_mb * 0.75)
+                if memory > _cap_mb:
+                    self.log(f"Requested {memory} MB but only {_available_mb} MB available. Capping at {_cap_mb} MB.", "WARNING")
+                    memory = max(_cap_mb, 512)
             custom_jvm = profile.get("jvm_args", "")
 
             java_path = self._ensure_java_for_version(version, profile_name)
@@ -229,18 +416,40 @@ class LauncherCore:
 
             main_class = version_json.get("mainClass", "net.minecraft.client.main.Main")
             modloader_cp_entries_abs = []
+            forge_version_json = None
             if modloader != "None":
                 self.log(f"Processing mod loader: {modloader}")
                 if modloader == "Fabric":
                     main_class, modloader_cp_entries_abs = download_fabric(version, modloader_version, instance_dir, self.log)
                 elif modloader == "Quilt":
                     main_class, modloader_cp_entries_abs = download_quilt(version, modloader_version, instance_dir, self.log)
+                elif modloader == "Forge":
+                    main_class, modloader_cp_entries_abs, forge_version_json = download_forge(version, modloader_version, instance_dir, self.log, java_path)
                 else:
                     raise Exception(f"Unsupported mod loader: {modloader}")
 
-            # --- Auto-install CustomSkinLoader ---
-            if modloader != "None":
-                self._ensure_csl_installed(instance_dir, version, modloader)
+            # For 1.8.x, pre-create a valid launcher_profiles.json to prevent JSON parse crashes
+            if version.startswith("1.8"):
+                lp_path = instance_dir / "launcher_profiles.json"
+                if not lp_path.exists():
+                    try:
+                        with open(lp_path, "w", encoding="utf-8") as f:
+                            json.dump({"profiles": {}, "selectedProfile": "(Default)", "clientToken": "0"}, f)
+                        self.log("Created launcher_profiles.json for 1.8.x", "INFO")
+                    except Exception as e:
+                        self.log(f"Could not create launcher_profiles.json: {e}", "WARNING")
+                else:
+                    try:
+                        with open(lp_path, "r", encoding="utf-8") as f:
+                            json.load(f)
+                    except Exception:
+                        self.log("launcher_profiles.json is corrupt, recreating...", "WARNING")
+                        try:
+                            with open(lp_path, "w", encoding="utf-8") as f:
+                                json.dump({"profiles": {}, "selectedProfile": "(Default)", "clientToken": "0"}, f)
+                        except Exception as e2:
+                            self.log(f"Could not recreate launcher_profiles.json: {e2}", "WARNING")
+
 
             # --- Classpath ---
             cp_entries_abs = []
@@ -258,12 +467,44 @@ class LauncherCore:
                 except ValueError:
                     cp_entries.append(entry)
 
+            # Detect Java major version early so it can gate both the classpath
+            # argument style and the JVM flags below.
+            _java_major = 8
+            _java_is_32bit = False
+            try:
+                import subprocess as _sp
+                _r = _sp.run([java_path, "-version"], capture_output=True, text=True, timeout=5)
+                _out = _r.stderr + _r.stdout
+                import re as _re
+                _m = _re.search(r'version "(\d+)[\._]', _out)
+                if _m:
+                    _java_major = int(_m.group(1))
+                    if _java_major == 1:
+                        _java_major = 8
+                _java_is_32bit = "32-Bit" in _out or "(x86)" in java_path
+            except Exception:
+                pass
+            self.log(f"Detected Java major version: {_java_major}", "DEBUG")
+            if _java_is_32bit:
+                self.log("32-bit Java detected. Capping memory at 512 MB to avoid VM initialisation failure.", "WARNING")
+                memory = min(memory, 512)
+
             classpath_file = instance_dir / "classpath.txt"
             cp_str = os.pathsep.join(cp_entries)
             with open(classpath_file, "w", encoding="utf-8") as f:
                 f.write(cp_str)
             self.log(f"Classpath written to {classpath_file}", "INFO")
-            cp_arg = f"@{classpath_file.absolute()}"
+            # @argfile is Java 9+ only; Java 8 must receive the classpath directly
+            if _java_major >= 9:
+                cp_arg = f"@{classpath_file.absolute()}"
+            else:
+                cp_arg = cp_str
+
+            import uuid as _uuid_mod
+            _offline_uuid = str(_uuid_mod.uuid3(
+                _uuid_mod.UUID(int=0x6ba7b8109dad11d180b400c04fd430c8),
+                "OfflinePlayer:" + username
+            ))
 
             subs = {
                 "${game_directory}": str(instance_dir),
@@ -271,7 +512,7 @@ class LauncherCore:
                 "${assets_index_name}": version_json.get("assetIndex", {}).get("id", version),
                 "${version_name}": version,
                 "${auth_player_name}": username,
-                "${auth_uuid}": "00000000-0000-0000-0000-000000000000",
+                "${auth_uuid}": _offline_uuid,
                 "${auth_access_token}": "offline",
                 "${user_type}": "legacy",
                 "${natives_directory}": str(natives_dir),
@@ -279,7 +520,8 @@ class LauncherCore:
                 "${launcher_version}": "1.0",
                 "${clientid}": "00000000-0000-0000-0000-000000000000",
                 "${auth_xuid}": "0000000000000000",
-                "${version_type}": "release"
+                "${version_type}": "release",
+                "${user_properties}": "{}"
             }
 
             # Build JVM args
@@ -299,9 +541,12 @@ class LauncherCore:
             if custom_jvm:
                 jvm_args.extend(custom_jvm.split())
 
-            # Extra flags
-            jvm_args.append("--add-exports=java.base/jdk.internal.misc=ALL-UNNAMED")
-            jvm_args.append("--enable-native-access=ALL-UNNAMED")
+            # Java 9+ flags only
+            if _java_major >= 9:
+                jvm_args.append("--add-exports=java.base/jdk.internal.misc=ALL-UNNAMED")
+            if _java_major >= 17:
+                jvm_args.append("--enable-native-access=ALL-UNNAMED")
+
             jvm_args.append("-Dorg.lwjgl.system.jemalloc.disable=true")
             jvm_args.append("-Dorg.lwjgl.util.DisableLWJGLThreadLocal=true")
             jvm_args.append("-Drealms.enabled=false")
@@ -310,6 +555,10 @@ class LauncherCore:
             jvm_args.append("-XX:-DisplayVMOutputToStderr")
             jvm_args.append(f"-Djava.library.path={natives_dir}")
             jvm_args.append(f"-Dorg.lwjgl.librarypath={natives_dir}")
+            jvm_args.append("-Djava.awt.headless=false")
+            # Force LWJGL 2 to create the window on the primary display
+            jvm_args.append("-Dorg.lwjgl.opengl.Display.allowSoftwareOpenGL=false")
+            jvm_args.append("-Dorg.lwjgl.input.Mouse.allowNegativeMouseCoords=true")
 
             if version in ("1.16.5", "1.17.1"):
                 jvm_args.append("-Dorg.lwjgl.util.Debug=true")
@@ -328,20 +577,43 @@ class LauncherCore:
                     elif isinstance(arg, dict) and arg.get("rules"):
                         pass
             elif "minecraftArguments" in version_json:
-                arg_str = version_json["minecraftArguments"]
-                for key, val in subs.items():
-                    arg_str = arg_str.replace(key, val)
-                game_args = arg_str.split()
+                # Split on spaces first, then substitute so paths with spaces are kept intact.
+                for token in version_json["minecraftArguments"].split():
+                    for key, val in subs.items():
+                        token = token.replace(key, val)
+                    game_args.append(token)
 
-            # ---------- SKIN INJECTION (CSL LocalSkin method) ----------
+            # Append Forge-specific game and JVM args from its version.json
+            if forge_version_json:
+                fargs = forge_version_json.get("arguments", {})
+                for arg in fargs.get("game", []):
+                    if isinstance(arg, str):
+                        for key, val in subs.items():
+                            arg = arg.replace(key, val)
+                        game_args.append(arg)
+                for arg in fargs.get("jvm", []):
+                    if isinstance(arg, str):
+                        for key, val in subs.items():
+                            arg = arg.replace(key, val)
+                        jvm_args.append(arg)
+
+            # Ensure a window size is set; LWJGL 2 may not show the window without it
+            if "--width" not in game_args:
+                game_args += ["--width", "854", "--height", "480"]
+
+            # ---------- SKIN INJECTION ----------
             account_name = profile.get("account")
             if account_name:
                 skin_path = self.account_manager.get_skin(account_name)
                 if skin_path and os.path.isfile(skin_path):
-                    self._deploy_csl_local_skin(instance_dir, username, skin_path)
+                    if modloader in ("Fabric", "Quilt"):
+                        self._ensure_csl_installed(instance_dir, version, modloader)
+                        self._deploy_csl_local_skin(instance_dir, username, skin_path)
+                    # Resource pack fallback for Vanilla and Forge
+                    self._inject_skin_resourcepack(instance_dir, skin_path, version)
                 else:
-                    self.log(f"No valid skin for account '{account_name}'.", "DEBUG")
-            # ---------------------------------------------------------------
+                    self.log(f"No skin set for account '{account_name}'.", "DEBUG")
+            # ---------------------------------------------------
 
             cmd = [java_path] + jvm_args + ["-cp", cp_arg, main_class] + game_args
 
@@ -357,8 +629,9 @@ class LauncherCore:
                 f.write(" ".join(cmd_quoted) + "\n")
                 f.write("pause\n")
 
+            _launch_start = time.time()
             self.log("Launching Minecraft...")
-            kwargs = get_subprocess_kwargs()
+            kwargs = get_subprocess_kwargs(hide_window=False)
             process = subprocess.Popen(
                 cmd,
                 cwd=str(instance_dir),
@@ -369,6 +642,7 @@ class LauncherCore:
                 universal_newlines=True,
                 **kwargs
             )
+            self._mc_process = process
 
             # Capture output
             stdout_full = []
@@ -382,7 +656,11 @@ class LauncherCore:
             def read_stderr():
                 skip_patterns = ["WARNING", "Unsafe", "LWJGL", "JNI", "deprecated", "objectFieldOffset", "Unsupported JNI version"]
                 for line in process.stderr:
-                    if any(pattern in line for pattern in skip_patterns):
+                    # Never suppress exception lines regardless of content
+                    is_exception = (line.startswith("Exception in") or
+                                    line.startswith("Caused by:") or
+                                    line.strip().startswith("at "))
+                    if not is_exception and any(pattern in line for pattern in skip_patterns):
                         continue
                     self.log(f"[STDERR] {line.rstrip()}", "ERROR")
                     stderr_full.append(line)
@@ -393,6 +671,14 @@ class LauncherCore:
             stderr_thread.start()
 
             exit_code = process.wait()
+            self._mc_process = None
+            _elapsed = int(time.time() - _launch_start)
+            try:
+                _prof = self.profile_manager.get_profile(profile_name)
+                _prev = int(_prof.get("play_time_seconds", 0))
+                self.profile_manager.update_profile(profile_name, play_time_seconds=_prev + _elapsed)
+            except Exception:
+                pass
             stdout_log = ''.join(stdout_full)
             stderr_log = ''.join(stderr_full)
 
@@ -458,9 +744,22 @@ class LauncherCore:
         self.log("Modifying client JAR to change splash text...", "INFO")
         temp_jar = jar_path.with_suffix(".tmp.jar")
         try:
-            shutil.copy2(jar_path, temp_jar)
-            with zipfile.ZipFile(temp_jar, 'a') as zf:
-                zf.writestr(splash_path, new_content)
+            # Rewrite the JAR, replacing splashes.txt and stripping the code-signing
+            # files (META-INF/*.SF / *.RSA / *.DSA). Without the .SF file Java's
+            # JarVerifier does not attempt SHA-256 verification, so the modified
+            # entry no longer triggers a SecurityException.
+            with zipfile.ZipFile(jar_path, 'r') as src_zf, \
+                 zipfile.ZipFile(temp_jar, 'w', compression=zipfile.ZIP_DEFLATED) as dst_zf:
+                for item in src_zf.infolist():
+                    name = item.filename
+                    # Drop code-signing files
+                    if name.upper().startswith("META-INF/") and name.upper().endswith((".SF", ".RSA", ".DSA")):
+                        continue
+                    # Replace splash with our version
+                    if name == splash_path:
+                        dst_zf.writestr(item, new_content.encode("utf-8"))
+                    else:
+                        dst_zf.writestr(item, src_zf.read(name))
             shutil.move(temp_jar, jar_path)
             self.log("Client JAR modified successfully.", "SUCCESS")
         except PermissionError:
@@ -591,18 +890,47 @@ class LauncherCore:
         libraries = version_json.get("libraries", [])
         cp_entries_abs = [str(client_path)]
         tasks = []
+
+        system = platform.system().lower()
+        # Map platform to the natives classifier key used in version JSONs
+        if system == "windows":
+            native_key = "natives-windows"
+        elif system == "darwin":
+            native_key = "natives-osx"
+        else:
+            native_key = "natives-linux"
+
         for lib in libraries:
-            if "downloads" in lib and "artifact" in lib["downloads"]:
-                path = lib["downloads"]["artifact"]["path"]
+            downloads = lib.get("downloads", {})
+
+            # Main artifact
+            if "artifact" in downloads:
+                path = downloads["artifact"]["path"]
                 if "jemalloc" in path.lower():
                     continue
-                artifact = lib["downloads"]["artifact"]
-                url = artifact["url"]
+                url = downloads["artifact"]["url"]
                 lib_path = libraries_dir / path
                 if not lib_path.exists():
                     lib_path.parent.mkdir(parents=True, exist_ok=True)
                     tasks.append((url, lib_path))
                 cp_entries_abs.append(str(lib_path))
+
+            # Native classifier jar (contains the .dll / .so / .dylib files)
+            classifiers = downloads.get("classifiers", {})
+            native_classifier = classifiers.get(native_key)
+            # Also try architecture-specific variant (e.g. natives-windows-64)
+            if native_classifier is None:
+                arch = platform.machine()
+                bits = "64" if ("64" in arch or arch == "AMD64") else "32"
+                native_classifier = classifiers.get(f"{native_key}-{bits}")
+            if native_classifier:
+                nat_path = native_classifier["path"]
+                nat_url = native_classifier["url"]
+                nat_lib_path = libraries_dir / nat_path
+                if not nat_lib_path.exists():
+                    nat_lib_path.parent.mkdir(parents=True, exist_ok=True)
+                    tasks.append((nat_url, nat_lib_path))
+
         if tasks:
             self.log(f"Downloading {len(tasks)} libraries...")
             session = requests.Session()
@@ -665,7 +993,12 @@ class LauncherCore:
             self.log(f"Unsupported OS: {system}", "ERROR")
             return None
 
-        api_url = f"https://api.adoptium.net/v3/assets/version/{required_major}/{os_name}/{arch_name}/jre/hotspot/normal"
+        api_url = (
+            f"https://api.adoptium.net/v3/assets/feature_releases/{required_major}/ga"
+            f"?architecture={arch_name}&heap_size=normal&image_type=jre"
+            f"&jvm_impl=hotspot&os={os_name}&page=0&page_size=1"
+            f"&project=jdk&sort_method=DEFAULT&sort_order=DESC&vendor=eclipse"
+        )
         self.log(f"Querying Java download: {api_url}", "INFO")
         try:
             resp = requests.get(api_url, timeout=30)
@@ -678,10 +1011,7 @@ class LauncherCore:
             download_url = None
             for pkg in binary.get("binaries", []):
                 if pkg.get("image_type") == "jre":
-                    for link in pkg.get("package", {}).get("link", []):
-                        if link.get("rel") == "direct":
-                            download_url = link.get("href")
-                            break
+                    download_url = pkg.get("package", {}).get("link")
                     if download_url:
                         break
             if not download_url:

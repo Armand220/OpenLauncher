@@ -22,13 +22,19 @@ from ui_tabs import build_tabs
 
 DEFAULT_VERSION = "1.21.1"
 DEFAULT_USERNAME = "OfflinePlayer"
-PURPLE = "#9B59B6"
-PURPLE_DARK = "#6C3483"
+PURPLE       = "#9B59B6"
+PURPLE_DARK  = "#6C3483"
 PURPLE_LIGHT = "#A569BD"
-BG_DARK = "#1E1E1E"
-BG_FRAME = "#2D2D2D"
-TEXT_LIGHT = "#E0E0E0"
-TEXT_DIM = "#A0A0A0"
+PURPLE_GLOW  = "#C39BD3"
+BG_DARK      = "#141414"
+BG_FRAME     = "#1E1E1E"
+BG_CARD      = "#252525"
+BORDER_COLOR = "#333333"
+TEXT_LIGHT   = "#E8E8E8"
+TEXT_DIM     = "#888888"
+ACCENT_GREEN = "#2ECC71"
+ACCENT_RED   = "#E74C3C"
+ACCENT_YELLOW= "#F1C40F"
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -36,20 +42,39 @@ ctk.set_default_color_theme("dark-blue")
 class OpenLauncherApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("OpenLauncher")
-        self.geometry("1200x750")
-        self.minsize(1000, 650)
+        self.title("OpenLauncher v6.0")
+        self.geometry("1280x780")
+        self.minsize(1050, 680)
         self.configure(fg_color=BG_DARK)
 
-        # Clear old log file at startup
-        log_path = Path("launcher.log")
-        if log_path.exists():
+        # Animation state
+        self._launch_btn = None
+        self._launch_animating = False
+        self._pulse_step = 0
+        self._bounce_active = False
+        self._flash_counter = 0
+
+        # Fade-in on startup
+        self.attributes("-alpha", 0.0)
+        self.after(50, self._fade_in)
+
+        # Per-session log file -- keep last 5, prune older ones
+        import glob as _glob
+        _ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._log_path = Path(f"launcher_{_ts}.log")
+        _old_logs = sorted(_glob.glob("launcher_????????_??????.log"))
+        while len(_old_logs) >= 5:
             try:
-                log_path.unlink()
-            except:
+                Path(_old_logs.pop(0)).unlink()
+            except Exception:
                 pass
 
-        self.workdir_var = tk.StringVar(value=os.path.join(os.getcwd(), "minecraft_offline"))
+        import sys
+        if getattr(sys, "frozen", False):
+            _script_dir = os.path.dirname(sys.executable)
+        else:
+            _script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.workdir_var = tk.StringVar(value=os.path.join(_script_dir, "minecraft_offline"))
         self.profile_manager = ProfileManager(self.workdir_var.get())
         self.account_manager = AccountManager(self.workdir_var.get())
 
@@ -59,29 +84,70 @@ class OpenLauncherApp(ctk.CTk):
         self.refresh_accounts()
 
         self.launcher_core = None
+        self._dot_breathing = False
+        self._dot_breathe_step = 0
+        self.after(1200, self._start_dot_breathe)
 
     def build_ui(self):
-        # Top toolbar
-        top_frame = ctk.CTkFrame(self, fg_color=BG_FRAME, corner_radius=12)
-        top_frame.pack(fill="x", padx=15, pady=(15, 5))
+        # ── Header bar ──────────────────────────────────────────────────────────
+        header = ctk.CTkFrame(self, fg_color=BG_FRAME, corner_radius=0, height=52)
+        header.pack(fill="x", padx=0, pady=0)
+        header.pack_propagate(False)
 
-        ctk.CTkLabel(top_frame, text="Work Dir:", font=ctk.CTkFont(size=13)).pack(side="left", padx=(10, 5))
-        self.dir_entry = ctk.CTkEntry(top_frame, textvariable=self.workdir_var, width=280, corner_radius=8, fg_color=BG_DARK, text_color=TEXT_LIGHT)
-        self.dir_entry.pack(side="left", padx=5, fill="x", expand=True)
+        self._title_label = ctk.CTkLabel(
+            header, text="  ",
+            font=ctk.CTkFont(family="Segoe UI", size=20, weight="bold"),
+            text_color=PURPLE_GLOW
+        )
+        self._title_label.pack(side="left", padx=(18, 6), pady=10)
+        self._version_label = ctk.CTkLabel(
+            header, text="",
+            font=ctk.CTkFont(size=11),
+            text_color=TEXT_DIM
+        )
+        self._version_label.pack(side="left", pady=16)
+        # Typewriter animation starts after fade-in
+        self.after(400, lambda: self._typewriter("  OpenLauncher", 0))
 
-        ctk.CTkButton(top_frame, text="Browse", width=80, height=30, corner_radius=8, fg_color=PURPLE, hover_color=PURPLE_DARK, command=self.browse_workdir).pack(side="left", padx=5)
+        # Workdir row inside header
+        ctk.CTkLabel(header, text="Work Dir:", font=ctk.CTkFont(size=12), text_color=TEXT_DIM).pack(side="left", padx=(30, 4))
+        self.dir_entry = ctk.CTkEntry(
+            header, textvariable=self.workdir_var, width=300,
+            corner_radius=8, fg_color=BG_DARK, text_color=TEXT_LIGHT,
+            border_color=BORDER_COLOR, border_width=1
+        )
+        self.dir_entry.pack(side="left", padx=4, fill="x", expand=True)
+        ctk.CTkButton(header, text="Browse", width=80, height=30, corner_radius=8,
+                      fg_color=PURPLE, hover_color=PURPLE_DARK,
+                      command=self.browse_workdir).pack(side="left", padx=(4, 2))
+        ctk.CTkButton(header, text="Refresh", width=76, height=30, corner_radius=8,
+                      fg_color=BG_CARD, hover_color=BORDER_COLOR,
+                      command=self.refresh_profiles).pack(side="left", padx=(2, 14))
 
-        ctk.CTkButton(top_frame, text="Refresh", width=70, height=30, corner_radius=8, fg_color=PURPLE, hover_color=PURPLE_DARK, command=self.refresh_profiles).pack(side="left", padx=5)
+        # Animated accent line under header
+        self._accent_canvas = tk.Canvas(self, height=3, highlightthickness=0, bg=PURPLE_DARK)
+        self._accent_canvas.pack(fill="x")
+        self._accent_step = 0
+        self.after(600, self._animate_accent_line)
 
-        # Main row
+        # ── Main content row ─────────────────────────────────────────────────────
         main_row = ctk.CTkFrame(self, fg_color="transparent")
-        main_row.pack(fill="both", expand=True, padx=15, pady=10)
+        main_row.pack(fill="both", expand=True, padx=14, pady=(10, 6))
 
-        # LEFT PANEL: Tabbed features
-        left_frame = ctk.CTkFrame(main_row, fg_color=BG_FRAME, corner_radius=16)
-        left_frame.pack(side="left", fill="both", expand=True, padx=(0, 10), pady=0)
+        # LEFT PANEL
+        left_frame = ctk.CTkFrame(main_row, fg_color=BG_FRAME, corner_radius=14,
+                                  border_color=BORDER_COLOR, border_width=1)
+        left_frame.pack(side="left", fill="both", expand=True, padx=(0, 8))
 
-        self.tabview = ctk.CTkTabview(left_frame, width=450, corner_radius=12, fg_color=BG_DARK, segmented_button_fg_color=BG_FRAME, segmented_button_selected_color=PURPLE, segmented_button_unselected_color=BG_DARK)
+        self.tabview = ctk.CTkTabview(
+            left_frame, width=450, corner_radius=10,
+            fg_color=BG_CARD,
+            segmented_button_fg_color=BG_FRAME,
+            segmented_button_selected_color=PURPLE,
+            segmented_button_selected_hover_color=PURPLE_DARK,
+            segmented_button_unselected_color=BG_FRAME,
+            segmented_button_unselected_hover_color=BG_CARD,
+        )
         self.tabview.pack(fill="both", expand=True, padx=10, pady=10)
 
         self.tabview.add("Mods")
@@ -90,65 +156,143 @@ class OpenLauncherApp(ctk.CTk):
         self.tabview.add("Java")
         self.tabview.add("Accounts")
 
-        self.ui_refs = build_tabs(self.tabview, self.profile_manager, self.workdir_var, self.log, self.refresh_profiles, self.get_selected_profile)
-
-        # Build Accounts tab
+        self.ui_refs = build_tabs(self.tabview, self.profile_manager, self.workdir_var,
+                                   self.log, self.refresh_profiles, self.get_selected_profile)
         self.build_accounts_tab(self.tabview.tab("Accounts"))
 
-        # RIGHT PANEL: Profiles (simple Listbox)
-        right_frame = ctk.CTkFrame(main_row, fg_color=BG_FRAME, corner_radius=16)
-        right_frame.pack(side="right", fill="both", expand=True, padx=(0, 0))
+        # RIGHT PANEL
+        right_frame = ctk.CTkFrame(main_row, fg_color=BG_FRAME, corner_radius=14,
+                                   border_color=BORDER_COLOR, border_width=1)
+        right_frame.pack(side="right", fill="both", expand=True)
 
-        ctk.CTkLabel(right_frame, text="Profiles", font=ctk.CTkFont(size=15, weight="bold"), text_color=PURPLE_LIGHT).pack(pady=(10, 5), anchor="w", padx=15)
+        # Profile panel header
+        prof_hdr = ctk.CTkFrame(right_frame, fg_color=BG_CARD, corner_radius=10)
+        prof_hdr.pack(fill="x", padx=10, pady=(10, 0))
+        ctk.CTkLabel(prof_hdr, text="Profiles",
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color=PURPLE_GLOW).pack(side="left", padx=12, pady=8)
+
+        self.profile_count_label = ctk.CTkLabel(
+            prof_hdr, text="0 profiles",
+            font=ctk.CTkFont(size=11), text_color=TEXT_DIM)
+        self.profile_count_label.pack(side="right", padx=12)
+
+        # Profile listbox with a subtle inner border
+        lb_frame = ctk.CTkFrame(right_frame, fg_color=BG_DARK, corner_radius=10,
+                                border_color=BORDER_COLOR, border_width=1)
+        lb_frame.pack(fill="both", expand=True, padx=10, pady=6)
 
         self.profile_listbox = tk.Listbox(
-            right_frame,
-            bg=BG_DARK,
-            fg=TEXT_LIGHT,
-            selectbackground=PURPLE,
-            selectforeground="white",
+            lb_frame,
+            bg=BG_DARK, fg=TEXT_LIGHT,
+            selectbackground=PURPLE, selectforeground="white",
             font=("Segoe UI", 11),
-            relief="flat",
-            borderwidth=0,
-            highlightthickness=0,
-            activestyle="none"
+            relief="flat", borderwidth=0, highlightthickness=0,
+            activestyle="none", cursor="hand2"
         )
-        self.profile_listbox.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.profile_listbox.pack(fill="both", expand=True, padx=6, pady=6)
         self.profile_listbox.bind("<Double-Button-1>", self.launch_selected)
         self.profile_listbox.bind("<<ListboxSelect>>", self.on_profile_selected)
 
-        action_frame = ctk.CTkFrame(right_frame, fg_color="transparent")
-        action_frame.pack(fill="x", padx=10, pady=(0, 10))
+        # Profile details strip
+        self._profile_details_label = ctk.CTkLabel(
+            right_frame, text="", font=ctk.CTkFont(size=10),
+            text_color=TEXT_DIM, anchor="w")
+        self._profile_details_label.pack(fill="x", padx=16, pady=(0, 2))
 
-        ctk.CTkButton(action_frame, text="▶ Launch", height=36, corner_radius=8, fg_color=PURPLE, hover_color=PURPLE_DARK, font=ctk.CTkFont(size=13, weight="bold"), command=self.launch_selected).pack(side="left", padx=2, expand=True, fill="x")
-        ctk.CTkButton(action_frame, text="＋ Add", height=36, corner_radius=8, fg_color=PURPLE, hover_color=PURPLE_DARK, command=self.add_profile_dialog).pack(side="left", padx=2, expand=True, fill="x")
-        ctk.CTkButton(action_frame, text="✎ Edit", height=36, corner_radius=8, fg_color=PURPLE, hover_color=PURPLE_DARK, command=self.edit_profile_dialog).pack(side="left", padx=2, expand=True, fill="x")
-        ctk.CTkButton(action_frame, text="✕ Delete", height=36, corner_radius=8, fg_color=PURPLE, hover_color=PURPLE_DARK, command=self.delete_profile).pack(side="left", padx=2, expand=True, fill="x")
+        # Action buttons -- row 1: Launch + Stop
+        action_row1 = ctk.CTkFrame(right_frame, fg_color="transparent")
+        action_row1.pack(fill="x", padx=10, pady=(0, 2))
 
-        # Bottom: progress and log
-        progress_frame = ctk.CTkFrame(self, fg_color=BG_FRAME, corner_radius=12)
-        progress_frame.pack(fill="x", padx=15, pady=(0, 5))
+        self._launch_btn = ctk.CTkButton(
+            action_row1, text="  Launch", height=40, corner_radius=10,
+            fg_color=PURPLE, hover_color=PURPLE_DARK,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            command=self._on_launch_click)
+        self._launch_btn.pack(side="left", padx=(0, 2), expand=True, fill="x")
 
-        self.progress_bar = ctk.CTkProgressBar(progress_frame, width=400, height=14, corner_radius=7, progress_color=PURPLE_LIGHT, fg_color=BG_DARK)
-        self.progress_bar.pack(side="left", padx=(15, 10), fill="x", expand=True)
+        self._stop_btn = ctk.CTkButton(
+            action_row1, text="Stop", height=40, corner_radius=10,
+            fg_color="#3a1a1a", hover_color="#5a2a2a", text_color="#e08080",
+            font=ctk.CTkFont(size=12),
+            state="disabled",
+            command=self._on_stop_click)
+        self._stop_btn.pack(side="left", padx=(2, 0), expand=True, fill="x")
+
+        # Action buttons -- row 2: Add + Edit + Delete
+        action_row2 = ctk.CTkFrame(right_frame, fg_color="transparent")
+        action_row2.pack(fill="x", padx=10, pady=(0, 2))
+
+        ctk.CTkButton(action_row2, text="Add", height=34, corner_radius=10,
+                      fg_color=BG_CARD, hover_color=BORDER_COLOR, text_color=TEXT_LIGHT,
+                      font=ctk.CTkFont(size=12),
+                      command=self.add_profile_dialog).pack(side="left", padx=(0, 2), expand=True, fill="x")
+        ctk.CTkButton(action_row2, text="Edit", height=34, corner_radius=10,
+                      fg_color=BG_CARD, hover_color=BORDER_COLOR, text_color=TEXT_LIGHT,
+                      font=ctk.CTkFont(size=12),
+                      command=self.edit_profile_dialog).pack(side="left", padx=2, expand=True, fill="x")
+        ctk.CTkButton(action_row2, text="Delete", height=34, corner_radius=10,
+                      fg_color="#3a1a1a", hover_color="#5a2a2a", text_color="#e08080",
+                      font=ctk.CTkFont(size=12),
+                      command=self.delete_profile).pack(side="left", padx=(2, 0), expand=True, fill="x")
+
+        repair_frame = ctk.CTkFrame(right_frame, fg_color="transparent")
+        repair_frame.pack(fill="x", padx=10, pady=(0, 4))
+        ctk.CTkButton(repair_frame, text="Repair Instance", height=28, corner_radius=8,
+                      fg_color=BG_CARD, hover_color=BORDER_COLOR, text_color=TEXT_DIM,
+                      font=ctk.CTkFont(size=11),
+                      command=self._on_repair_click).pack(fill="x")
+
+        # ── Progress bar (inside right panel, above console) ─────────────────────
+        progress_frame = ctk.CTkFrame(right_frame, fg_color=BG_CARD, corner_radius=10)
+        progress_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+        self.progress_label = ctk.CTkLabel(
+            progress_frame, text="Ready",
+            font=ctk.CTkFont(size=11, weight="bold"), text_color=PURPLE_LIGHT, width=80)
+        self.progress_label.pack(side="left", padx=(10, 4), pady=6)
+
+        self.progress_bar = ctk.CTkProgressBar(
+            progress_frame, height=10, corner_radius=5,
+            progress_color=PURPLE, fg_color=BG_DARK)
+        self.progress_bar.pack(side="left", padx=4, fill="x", expand=True, pady=6)
         self.progress_bar.set(0)
 
-        self.progress_label = ctk.CTkLabel(progress_frame, text="Ready", font=ctk.CTkFont(size=12), text_color=TEXT_DIM, width=120)
-        self.progress_label.pack(side="right", padx=(10, 15))
+        self._progress_pct_label = ctk.CTkLabel(
+            progress_frame, text="", width=38,
+            font=ctk.CTkFont(size=10), text_color=TEXT_DIM)
+        self._progress_pct_label.pack(side="right", padx=(0, 8))
 
-        log_frame = ctk.CTkFrame(self, fg_color=BG_FRAME, corner_radius=16)
-        log_frame.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        # ── Log panel ────────────────────────────────────────────────────────────
+        log_frame = ctk.CTkFrame(self, fg_color=BG_FRAME, corner_radius=14,
+                                  border_color=BORDER_COLOR, border_width=1)
+        log_frame.pack(fill="both", expand=True, padx=14, pady=(0, 14))
 
-        ctk.CTkLabel(log_frame, text="Log", font=ctk.CTkFont(size=14, weight="bold"), text_color=PURPLE_LIGHT).pack(anchor="w", padx=(15, 0), pady=(10, 0))
+        log_hdr = ctk.CTkFrame(log_frame, fg_color=BG_CARD, corner_radius=10)
+        log_hdr.pack(fill="x", padx=8, pady=(8, 0))
+        ctk.CTkLabel(log_hdr, text="Console",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color=PURPLE_LIGHT).pack(side="left", padx=10, pady=5)
+        self._log_status_dot = ctk.CTkLabel(log_hdr, text="●", text_color=TEXT_DIM,
+                                             font=ctk.CTkFont(size=10))
+        self._log_status_dot.pack(side="right", padx=10)
 
-        self.log_text = scrolledtext.ScrolledText(log_frame, wrap="word", height=8, bg=BG_DARK, fg=TEXT_LIGHT, insertbackground="white", font=("Consolas", 10), relief="flat", borderwidth=0)
-        self.log_text.pack(fill="both", expand=True, padx=10, pady=(5, 10))
-        self.log_text.tag_configure('INFO', foreground=TEXT_LIGHT)
-        self.log_text.tag_configure('WARNING', foreground='#F1C40F')
-        self.log_text.tag_configure('ERROR', foreground='#E74C3C')
-        self.log_text.tag_configure('SUCCESS', foreground='#2ECC71')
+        self.log_text = scrolledtext.ScrolledText(
+            log_frame, wrap="word", height=7,
+            bg="#0e0e0e", fg=TEXT_LIGHT,
+            insertbackground="white",
+            font=("Consolas", 10), relief="flat", borderwidth=0,
+            selectbackground=PURPLE_DARK, selectforeground="white"
+        )
+        self.log_text.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+        self.log_text.tag_configure("INFO",    foreground=TEXT_LIGHT)
+        self.log_text.tag_configure("DEBUG",   foreground=TEXT_DIM)
+        self.log_text.tag_configure("WARNING", foreground=ACCENT_YELLOW)
+        self.log_text.tag_configure("ERROR",   foreground=ACCENT_RED)
+        self.log_text.tag_configure("SUCCESS", foreground=ACCENT_GREEN)
+        self.log_text.tag_configure("FLASH",   foreground=PURPLE_GLOW)
 
-        # Initialise launcher core (pass account_manager)
+        # Initialise launcher core
         try:
             self.launcher_core = LauncherCore(
                 self.workdir_var.get(),
@@ -161,11 +305,189 @@ class OpenLauncherApp(ctk.CTk):
             self.log(f"Failed to initialise LauncherCore: {e}", "ERROR")
             messagebox.showerror("Error", f"Could not initialise launcher core:\n{e}")
 
+    # ── Typewriter title ─────────────────────────────────────────────────────
+    def _typewriter(self, full_text, idx):
+        if not hasattr(self, "_title_label"):
+            return
+        self._title_label.configure(text=full_text[:idx + 1])
+        if idx + 1 < len(full_text):
+            self.after(55, lambda: self._typewriter(full_text, idx + 1))
+        else:
+            # Show version badge after title finishes
+            self.after(120, lambda: self._version_label.configure(text="v6.0"))
+
+    # ── Animated accent line (sweeping highlight) ─────────────────────────────
+    def _animate_accent_line(self):
+        if not hasattr(self, "_accent_canvas"):
+            return
+        try:
+            w = self._accent_canvas.winfo_width()
+            if w < 2:
+                self.after(100, self._animate_accent_line)
+                return
+            self._accent_canvas.delete("all")
+            # Draw base
+            self._accent_canvas.configure(bg=PURPLE_DARK)
+            # Sweeping bright segment
+            pos = (self._accent_step % 120) / 120.0
+            cx = int(pos * w)
+            hw = int(w * 0.18)
+            x0, x1 = max(0, cx - hw), min(w, cx + hw)
+            self._accent_canvas.create_rectangle(x0, 0, x1, 3, fill=PURPLE_GLOW, outline="")
+            self._accent_step += 1
+        except Exception:
+            return
+        self.after(22, self._animate_accent_line)
+
+    # ── Idle status-dot breathing ────────────────────────────────────────────
+    def _start_dot_breathe(self):
+        self._dot_breathe_step = 0
+        self._dot_breathing = True
+        self._do_dot_breathe()
+
+    def _stop_dot_breathe(self):
+        self._dot_breathing = False
+
+    def _do_dot_breathe(self):
+        if not getattr(self, "_dot_breathing", False):
+            return
+        if not hasattr(self, "_log_status_dot"):
+            return
+        # Sine-wave interpolation between dim and purple
+        import math
+        t = (math.sin(self._dot_breathe_step * 0.12) + 1) / 2
+        color = self._lerp_color(TEXT_DIM, PURPLE_LIGHT, t)
+        try:
+            self._log_status_dot.configure(text_color=color)
+        except Exception:
+            return
+        self._dot_breathe_step += 1
+        self.after(40, self._do_dot_breathe)
+
+
+    # ── Profile list selection flash ─────────────────────────────────────────
+    def _flash_profile_selection(self):
+        """Briefly highlight selected profile row with a bright bg then settle."""
+        colors = [PURPLE_GLOW, PURPLE_LIGHT, PURPLE, PURPLE]
+        def _step(i):
+            if i >= len(colors):
+                return
+            try:
+                self.profile_listbox.configure(selectbackground=colors[i])
+            except Exception:
+                return
+            self.after(90, lambda: _step(i + 1))
+        _step(0)
+
+    # ── Startup fade-in ──────────────────────────────────────────────────────
+    def _fade_in(self, alpha=0.0):
+        alpha = min(alpha + 0.07, 1.0)
+        self.attributes("-alpha", alpha)
+        if alpha < 1.0:
+            self.after(18, lambda: self._fade_in(alpha))
+
+    # ── Launch button pulse ──────────────────────────────────────────────────
+    def _on_launch_click(self):
+        self._start_launch_pulse()
+        self._start_bounce()
+        if hasattr(self, "_stop_btn"):
+            self._stop_btn.configure(state="normal")
+        name = self.get_selected_profile()
+        if name:
+            self.title(f"OpenLauncher v6.0  --  Playing: {name}")
+        self.launch_selected()
+
+    def _on_stop_click(self):
+        if self.launcher_core:
+            self.launcher_core.stop()
+        if hasattr(self, "_stop_btn"):
+            self._stop_btn.configure(state="disabled")
+
+    def _on_repair_click(self):
+        name = self.get_selected_profile()
+        if not name:
+            return
+        profile = self.profile_manager.get_profile(name)
+        if not profile:
+            return
+        if not messagebox.askyesno("Repair Instance",
+                f"Re-download the client JAR and libraries for '{name}'?\n\n"
+                "Saves, mods, and configs will not be touched."):
+            return
+        if self.launcher_core:
+            self._start_bounce()
+            self.launcher_core.repair_instance(profile.get("version", ""), name)
+
+    def _start_launch_pulse(self):
+        self._launch_animating = True
+        self._pulse_step = 0
+        self._animate_launch_btn()
+
+    def _animate_launch_btn(self):
+        if not self._launch_animating or self._launch_btn is None:
+            return
+        # Alternate between light and dark purple rapidly for a flash feel
+        colors = [PURPLE_GLOW, PURPLE_DARK, PURPLE_GLOW, PURPLE_DARK,
+                  PURPLE,      PURPLE_DARK, PURPLE_GLOW, PURPLE_DARK,
+                  PURPLE_GLOW, PURPLE_DARK, PURPLE,      PURPLE_DARK]
+        color = colors[self._pulse_step % len(colors)]
+        try:
+            self._launch_btn.configure(fg_color=color)
+        except Exception:
+            return
+        self._pulse_step += 1
+        if self._pulse_step < len(colors):
+            self.after(120, self._animate_launch_btn)
+        else:
+            self._launch_animating = False
+            try:
+                self._launch_btn.configure(fg_color=PURPLE)
+            except Exception:
+                pass
+
+    # ── Indeterminate progress bar ────────────────────────────────────────────
+    def _start_bounce(self):
+        if self._bounce_active:
+            return
+        self._bounce_active = True
+        self._stop_dot_breathe()
+        try:
+            self.progress_bar.configure(mode="indeterminate")
+            self.progress_bar.start()
+        except Exception:
+            pass
+
+    def _stop_bounce(self):
+        self._bounce_active = False
+        try:
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="determinate")
+            self.progress_bar.set(0)
+            if hasattr(self, "_progress_pct_label"):
+                self._progress_pct_label.configure(text="")
+        except Exception:
+            pass
+        if hasattr(self, "_stop_btn"):
+            try:
+                self._stop_btn.configure(state="disabled")
+            except Exception:
+                pass
+        try:
+            self.title("OpenLauncher v6.0")
+        except Exception:
+            pass
+        self._start_dot_breathe()
+
     # ---------- Accounts tab ----------
     def build_accounts_tab(self, parent):
-        ctk.CTkLabel(parent, text="Account Manager", font=ctk.CTkFont(size=16, weight="bold"), text_color=PURPLE_LIGHT).pack(anchor="w", padx=10, pady=(10,5))
+        ctk.CTkLabel(parent, text="Account Manager", font=ctk.CTkFont(size=15, weight="bold"),
+                     text_color=PURPLE_GLOW).pack(anchor="w", padx=10, pady=(10, 5))
 
-        self.accounts_listbox = tk.Listbox(parent, bg=BG_DARK, fg=TEXT_LIGHT, selectbackground=PURPLE, selectforeground="white", font=("Segoe UI", 11), relief="flat", borderwidth=0, highlightthickness=0, activestyle="none")
+        self.accounts_listbox = tk.Listbox(
+            parent, bg=BG_DARK, fg=TEXT_LIGHT,
+            selectbackground=PURPLE, selectforeground="white",
+            font=("Segoe UI", 11), relief="flat", borderwidth=0,
+            highlightthickness=0, activestyle="none", cursor="hand2")
         self.accounts_listbox.pack(fill="both", expand=True, padx=10, pady=5)
         self.accounts_listbox.bind("<<ListboxSelect>>", self.on_account_selected)
 
@@ -319,28 +641,36 @@ class OpenLauncherApp(ctk.CTk):
     def get_selected_profile(self):
         selection = self.profile_listbox.curselection()
         if not selection:
-            return None
-        name = self.profile_listbox.get(selection[0])
-        if name == "No profiles. Click 'Add'.":
+            return self.current_profile
+        name = self.profile_listbox.get(selection[0]).strip()
+        if name in ("No profiles. Click 'Add'.", ""):
             return None
         return name
 
     def refresh_profiles(self):
         self.profile_manager = ProfileManager(self.workdir_var.get())
         self.profile_listbox.delete(0, tk.END)
-        for name in self.profile_manager.get_profile_names():
-            self.profile_listbox.insert(tk.END, name)
+        names = self.profile_manager.get_profile_names()
+        for i, name in enumerate(names):
+            self.profile_listbox.insert(tk.END, f"  {name}")
+            prof = self.profile_manager.get_profile(name)
+            if prof and self._version_warning(prof.get("version", "")):
+                self.profile_listbox.itemconfig(i, fg=ACCENT_YELLOW)
         if self.profile_listbox.size() == 0:
-            self.profile_listbox.insert(tk.END, "No profiles. Click 'Add'.")
+            self.profile_listbox.insert(tk.END, "  No profiles. Click 'Add'.")
         if self.profile_listbox.size() > 0:
             self.profile_listbox.selection_set(0)
             self.on_profile_selected(None)
+        if hasattr(self, "profile_count_label"):
+            n = len(names)
+            self.profile_count_label.configure(text=f"{n} profile{'s' if n != 1 else ''}")
 
     def on_profile_selected(self, event):
         name = self.get_selected_profile()
         if name:
             self.current_profile = name
             self.update_ui_for_profile(name)
+            self._flash_profile_selection()
         else:
             self.update_ui_for_profile(None)
 
@@ -352,10 +682,29 @@ class OpenLauncherApp(ctk.CTk):
             self.ui_refs["memory_slider"].set(2048)
             self.ui_refs["memory_label"].configure(text="2048 MB")
             self.ui_refs["jvm_args_entry"].delete(0, tk.END)
+            if hasattr(self, "_profile_details_label"):
+                self._profile_details_label.configure(text="")
             return
         profile = self.profile_manager.get_profile(profile_name)
         if not profile:
             return
+
+        # Details strip
+        if hasattr(self, "_profile_details_label"):
+            version = profile.get("version", "")
+            playtime = int(profile.get("play_time_seconds", 0))
+            notes = profile.get("notes", "").strip()
+            warn = self._version_warning(version)
+            parts = []
+            if version:
+                parts.append(f"v{version}" + ("  ⚠ " + warn if warn else ""))
+            if playtime > 0:
+                parts.append(self._format_playtime(playtime) + " played")
+            if notes:
+                parts.append(f'"{notes}"')
+            self._profile_details_label.configure(
+                text="  " + "   |   ".join(parts) if parts else "",
+                text_color=ACCENT_YELLOW if warn else TEXT_DIM)
 
         self.ui_refs["mods_listbox"].delete(0, tk.END)
         for mod in profile.get("mods", []):
@@ -379,14 +728,45 @@ class OpenLauncherApp(ctk.CTk):
         self.ui_refs["jvm_args_entry"].delete(0, tk.END)
         self.ui_refs["jvm_args_entry"].insert(0, profile.get("jvm_args", ""))
 
+    # ---------- Version warning ----------
+    @staticmethod
+    def _version_warning(version):
+        if version in ("1.16.5", "1.17.1"):
+            return "Known LWJGL/OpenGL instability"
+        try:
+            parts = version.split(".")
+            if int(parts[0]) == 1 and int(parts[1]) < 9:
+                return "Very old version -- may have compatibility issues"
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _format_playtime(seconds):
+        seconds = int(seconds)
+        if seconds < 60:
+            return f"{seconds}s"
+        if seconds < 3600:
+            return f"{seconds // 60}m"
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        return f"{h}h {m}m" if m else f"{h}h"
+
     # ---------- Progress callback ----------
     def update_progress(self, value, text):
         if isinstance(text, tuple) and text[0] == "crash":
             _, exit_code, instance_dir, crash_file = text
+            self.after(0, lambda: self._stop_bounce())
             self.after(0, lambda: self.show_crash_dialog(exit_code, instance_dir, crash_file))
             return
-        if value is not None:
+        # Stop bounce when returning to idle
+        if value == 0 and text == "Ready":
+            self.after(0, self._stop_bounce)
+        if value is not None and not self._bounce_active:
             self.progress_bar.set(value)
+            if hasattr(self, "_progress_pct_label"):
+                pct = int(value * 100)
+                self._progress_pct_label.configure(text=f"{pct}%" if pct > 0 else "")
         if text:
             self.progress_label.configure(text=text)
 
@@ -396,6 +776,14 @@ class OpenLauncherApp(ctk.CTk):
             with open(crash_file, "r", encoding="utf-8") as f:
                 content = f.read()
                 preview = content[:500] + ("..." if len(content) > 500 else "")
+
+        # Determine the MC version from the profile so suggestions are accurate
+        profile_name = Path(instance_dir).name if instance_dir else ""
+        mc_version = ""
+        if profile_name and self.profile_manager:
+            prof = self.profile_manager.get_profile(profile_name)
+            if prof:
+                mc_version = prof.get("version", "")
 
         dialog = ctk.CTkToplevel(self)
         dialog.title("Minecraft Crashed")
@@ -410,9 +798,9 @@ class OpenLauncherApp(ctk.CTk):
         suggestion = "Check the log for more details."
         if exit_code == -1073741819:
             suggestion = "This crash is often caused by graphics driver issues. Please update your GPU drivers."
-        elif exit_code == 1 and ("1.16.5" in str(instance_dir) or "1.17.1" in str(instance_dir)):
+        elif mc_version in ("1.16.5", "1.17.1"):
             suggestion = "For 1.16.5/1.17.1, try adding JVM flags: -Dorg.lwjgl.opengl.Display.allowSoftwareOpenGL=true"
-        ctk.CTkLabel(dialog, text=f"💡 {suggestion}", font=ctk.CTkFont(size=12), text_color="#F1C40F", wraplength=550).pack(pady=5)
+        ctk.CTkLabel(dialog, text=f"Suggestion: {suggestion}", font=ctk.CTkFont(size=12), text_color="#F1C40F", wraplength=550).pack(pady=5)
 
         log_frame = ctk.CTkFrame(dialog, fg_color=BG_FRAME, corner_radius=8)
         log_frame.pack(fill="both", expand=True, padx=10, pady=5)
@@ -444,10 +832,61 @@ class OpenLauncherApp(ctk.CTk):
 
     # ---------- Logging ----------
     def log(self, message, level="INFO"):
-        self.log_text.insert(tk.END, f"[{level}] {message}\n", level)
+        # Insert with a unique flash tag so we can animate this line
+        self._flash_counter += 1
+        flash_tag = f"flash_{self._flash_counter}"
+        level_colors = {"INFO": TEXT_LIGHT, "DEBUG": TEXT_DIM, "WARNING": ACCENT_YELLOW,
+                        "ERROR": ACCENT_RED, "SUCCESS": ACCENT_GREEN}
+        glow_color  = {"INFO": "#ffffff", "DEBUG": PURPLE_LIGHT, "WARNING": "#ffe57f",
+                        "ERROR": "#ff8888", "SUCCESS": "#7fffc0"}.get(level, "#ffffff")
+        final_color = level_colors.get(level, TEXT_LIGHT)
+
+        self.log_text.insert(tk.END, f"[{level}] {message}\n", (level, flash_tag))
+        self.log_text.tag_configure(flash_tag, foreground=glow_color)
         self.log_text.see(tk.END)
-        with open("launcher.log", "a", encoding="utf-8") as f:
+
+        # Fade the flash tag back to the normal level colour over ~400ms
+        self._fade_log_tag(flash_tag, glow_color, final_color, steps=8)
+
+        # Flash the console status dot
+        if hasattr(self, "_log_status_dot"):
+            dot_color = {"ERROR": ACCENT_RED, "WARNING": ACCENT_YELLOW,
+                         "SUCCESS": ACCENT_GREEN}.get(level, PURPLE_LIGHT)
+            self._log_status_dot.configure(text_color=dot_color)
+            self.after(600, lambda: self._log_status_dot.configure(text_color=TEXT_DIM)
+                       if hasattr(self, "_log_status_dot") else None)
+        with open(self._log_path, "a", encoding="utf-8") as f:
             f.write(f"[{level}] {message}\n")
+
+    def _fade_log_tag(self, tag, start_hex, end_hex, steps, step=0):
+        """Interpolate a text tag colour from start_hex to end_hex over `steps` frames."""
+        if step > steps:
+            try:
+                self.log_text.tag_configure(tag, foreground=end_hex)
+                self.log_text.tag_delete(tag)
+            except Exception:
+                pass
+            return
+        t = step / steps
+        color = self._lerp_color(start_hex, end_hex, t)
+        try:
+            self.log_text.tag_configure(tag, foreground=color)
+        except Exception:
+            return
+        self.after(50, lambda: self._fade_log_tag(tag, start_hex, end_hex, steps, step + 1))
+
+    @staticmethod
+    def _lerp_color(hex_a, hex_b, t):
+        """Linear interpolation between two hex colours."""
+        def parse(h):
+            h = h.lstrip("#")
+            return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        r1, g1, b1 = parse(hex_a)
+        r2, g2, b2 = parse(hex_b)
+        r = int(r1 + (r2 - r1) * t)
+        g = int(g1 + (g2 - g1) * t)
+        b = int(b1 + (b2 - b1) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
 
     # ---------- Top bar actions ----------
     def browse_workdir(self):
@@ -506,7 +945,7 @@ class OpenLauncherApp(ctk.CTk):
 
         ctk.CTkLabel(dialog, text="Mod Loader:").grid(row=row, column=0, padx=15, pady=10, sticky="w")
         loader_var = tk.StringVar(value="None")
-        loader_menu = ctk.CTkComboBox(dialog, values=["None", "Fabric", "Quilt"], variable=loader_var, width=200)
+        loader_menu = ctk.CTkComboBox(dialog, values=["None", "Fabric", "Quilt", "Forge"], variable=loader_var, width=200)
         loader_menu.grid(row=row, column=1, padx=5, pady=10, sticky="w")
         row += 1
 
@@ -522,18 +961,24 @@ class OpenLauncherApp(ctk.CTk):
         account_menu.grid(row=row, column=1, padx=5, pady=10, sticky="w")
         row += 1
 
+        ctk.CTkLabel(dialog, text="Notes:").grid(row=row, column=0, padx=15, pady=10, sticky="w")
+        notes_e = ctk.CTkEntry(dialog, width=250, corner_radius=8, placeholder_text="Optional note...")
+        notes_e.grid(row=row, column=1, padx=5, pady=10, sticky="w")
+        row += 1
+
         def do_add():
             n = name_e.get().strip()
             v = ver_e.get().strip()
             loader = loader_var.get()
             loader_ver = version_e.get().strip()
             account = account_var.get()
+            notes = notes_e.get().strip()
             if account == "Default":
                 account = None
             if not n or not v:
                 messagebox.showerror("Error", "Name and Version are required.")
                 return
-            if self.profile_manager.add_profile(n, v, loader, loader_ver, account=account):
+            if self.profile_manager.add_profile(n, v, loader, loader_ver, account=account, notes=notes):
                 self.refresh_profiles()
                 dialog.destroy()
                 self.log(f"Profile '{n}' added with loader {loader}.", "SUCCESS")
@@ -576,7 +1021,7 @@ class OpenLauncherApp(ctk.CTk):
 
         ctk.CTkLabel(dialog, text="Mod Loader:").grid(row=row, column=0, padx=15, pady=10, sticky="w")
         loader_var = tk.StringVar(value=current_loader)
-        loader_menu = ctk.CTkComboBox(dialog, values=["None", "Fabric", "Quilt"], variable=loader_var, width=200)
+        loader_menu = ctk.CTkComboBox(dialog, values=["None", "Fabric", "Quilt", "Forge"], variable=loader_var, width=200)
         loader_menu.grid(row=row, column=1, padx=5, pady=10, sticky="w")
         row += 1
 
@@ -657,6 +1102,12 @@ class OpenLauncherApp(ctk.CTk):
         account_menu.grid(row=row, column=1, padx=5, pady=10, sticky="w")
         row += 1
 
+        ctk.CTkLabel(dialog, text="Notes:").grid(row=row, column=0, padx=15, pady=10, sticky="w")
+        notes_e_edit = ctk.CTkEntry(dialog, corner_radius=8, placeholder_text="Optional note...")
+        notes_e_edit.insert(0, profile.get("notes", ""))
+        notes_e_edit.grid(row=row, column=1, padx=5, pady=10, sticky="ew")
+        row += 1
+
         def do_update():
             nn = name_e.get().strip()
             vv = ver_e.get().strip()
@@ -664,16 +1115,17 @@ class OpenLauncherApp(ctk.CTk):
             loader_ver = version_e.get().strip()
             jj = java_e.get().strip()
             account = account_var.get()
+            notes = notes_e_edit.get().strip()
             if account == "Default":
                 account = None
             if not nn or not vv:
                 messagebox.showerror("Error", "Name and Version required.")
                 return
-            if loader not in {"None", "Fabric", "Quilt"}:
+            if loader not in {"None", "Fabric", "Quilt", "Forge"}:
                 loader = "None"
 
             if nn != name:
-                if self.profile_manager.add_profile(nn, vv, loader, loader_ver, mods=profile.get("mods", []), resource_packs=profile.get("resource_packs", []), jvm_args=profile.get("jvm_args", ""), memory=profile.get("memory", "2048"), account=account):
+                if self.profile_manager.add_profile(nn, vv, loader, loader_ver, mods=profile.get("mods", []), resource_packs=profile.get("resource_packs", []), jvm_args=profile.get("jvm_args", ""), memory=profile.get("memory", "2048"), account=account, notes=notes):
                     if jj:
                         self.profile_manager.update_profile(nn, java_path=jj)
                     self.profile_manager.delete_profile(name)
@@ -685,7 +1137,7 @@ class OpenLauncherApp(ctk.CTk):
                     messagebox.showerror("Error", f"Could not rename to '{nn}'. The name may already exist.")
                     return
             else:
-                if self.profile_manager.update_profile(name, version=vv, modloader=loader, modloader_version=loader_ver, java_path=jj, account=account):
+                if self.profile_manager.update_profile(name, version=vv, modloader=loader, modloader_version=loader_ver, java_path=jj, account=account, notes=notes):
                     self.refresh_profiles()
                     dialog.destroy()
                     self.log(f"Profile '{name}' updated.", "SUCCESS")
@@ -765,7 +1217,7 @@ class OpenLauncherApp(ctk.CTk):
 
             version = profile.get("version")
             modloader = profile.get("modloader", "None")
-            if modloader not in {"None", "Fabric", "Quilt"}:
+            if modloader not in {"None", "Fabric", "Quilt", "Forge"}:
                 modloader = "None"
                 self.profile_manager.update_profile(name, modloader=modloader)
                 self.refresh_profiles()

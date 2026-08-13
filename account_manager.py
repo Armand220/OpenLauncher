@@ -64,18 +64,30 @@ class AccountManager:
         return False
 
     def get_skin(self, name):
-        """Return the stored skin file path for the given account name, or empty string."""
+        """Return the absolute skin file path for the given account, or empty string."""
         for acc in self.accounts:
             if acc["name"] == name:
-                return acc.get("skin", "")
+                stored = acc.get("skin", "")
+                if not stored:
+                    return ""
+                stored_path = Path(stored)
+                # If the stored value is already an absolute path that exists, use it.
+                if stored_path.is_absolute() and stored_path.exists():
+                    return str(stored_path)
+                # Otherwise treat it as a filename relative to workdir/accounts/skins/
+                relative = self.workdir / "accounts" / "skins" / stored_path.name
+                if relative.exists():
+                    return str(relative)
+                return ""
         return ""
 
     def set_skin(self, name, skin_path):
-        """Store a skin file path for the account. Pass None or '' to remove."""
+        """Store the skin filename (not full path) for the account. Pass None or '' to remove."""
         for acc in self.accounts:
             if acc["name"] == name:
                 if skin_path:
-                    acc["skin"] = skin_path
+                    # Store only the filename so the path is portable across machines.
+                    acc["skin"] = Path(skin_path).name
                 else:
                     acc.pop("skin", None)
                 self.save_accounts()
